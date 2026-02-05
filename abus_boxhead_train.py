@@ -416,18 +416,9 @@ if __name__ == "__main__":
                 writer.add_scalar(f"val/{k}", v, epoch)
 
             ap25 = metrics['det/AP@0.25']
-            print(f"             --- Segmentation ---")
             print(f"             Dice={metrics['seg/dice']:.4f}  "
-                  f"Sens={metrics['seg/sensitivity']:.4f}  "
-                  f"Prec={metrics['seg/precision']:.4f}")
-            print(f"             --- Detection ---")
-            print(f"             AP@0.1={metrics['det/AP@0.1']:.4f}  "
-                  f"AP@0.25={ap25:.4f}  "
-                  f"AP@0.5={metrics['det/AP@0.5']:.4f}  "
+                  f"IoU={metrics['det/mean_best_iou']:.4f}  "
                   f"mAP={metrics['det/mAP']:.4f}")
-            print(f"             recall@0.25={metrics['det/recall@0.25']:.4f}  "
-                  f"mean_IoU={metrics['det/mean_best_iou']:.4f}  "
-                  f"mean_GIoU={metrics['det/mean_giou']:.4f}")
 
             if ap25 > best_ap:
                 best_ap = ap25
