@@ -331,6 +331,9 @@ single-channel attention weight map with softmax over the full voxel space,
 performs weighted aggregation, and regresses normalised box parameters through
 an MLP.
 
+**Note:** Standard BoxHead training uses 128³ resized volumes (~30 sec/epoch).
+For full-resolution detection, see [Full-Resolution Detection](#full-resolution-detection) below.
+
 ## BoxHead Step 1 — Preprocessing
 
 Combines segmentation masks and detection boxes at 128^3 resolution.
@@ -370,6 +373,7 @@ python abus_boxhead_train.py --data_dir_train ./data/abus_boxhead/train --data_d
 | `--det_weight` | `5.0` | Detection loss weight relative to seg loss |
 | `--num_workers` | `4` | Data loader workers |
 | `--pretrained_seg` | `""` | Path to SegMamba segmentation checkpoint |
+| `--freeze_backbone` | (flag) | Freeze encoder/decoder, train BoxHead only |
 
 Loss: `total = (Dice + CE) + det_weight × (SmoothL1 + GIoU)`
 
@@ -414,3 +418,68 @@ python abus_boxhead_train.py
 python abus_boxhead_predict.py --model_path ./logs/segmamba_abus_boxhead/model/best_model_XXXX.pt
 python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abus_boxhead/detections.json --abus_root /Volumes/Autzoko/ABUS
 ```
+
+---
+
+# Full-Resolution Detection
+
+The standard detection pipelines (B, C, D) resize volumes to 128³, which may lose
+fine detail. For full-resolution detection, use one of these approaches:
+
+## Approach 1: Two-Stage Training (BoxHead)
+
+Train segmentation at full resolution first, then fine-tune only the BoxHead on
+128³ data with frozen encoder/decoder.
+
+```bash
+# Stage 1: Train segmentation at full resolution (~4 min/epoch)
+python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+python abus_train.py --max_epoch 1000
+
+# Stage 2: Fine-tune BoxHead only (~30 sec/epoch)
+python abus_boxhead_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+python abus_boxhead_train.py \
+    --pretrained_seg ./logs/segmamba_abus/model/best_model_XXXX.pt \
+    --freeze_backbone \
+    --max_epoch 200
+
+# Predict and evaluate
+python abus_boxhead_predict.py --model_path ./logs/segmamba_abus_boxhead/model/best_model_XXXX.pt
+python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abus_boxhead/detections.json --abus_root /Volumes/Autzoko/ABUS
+```
+
+## Approach 2: Derive Boxes from Segmentation
+
+Train segmentation at full resolution and extract bounding boxes from the
+predicted masks using connected component analysis. No separate detection head
+needed.
+
+```bash
+# Train segmentation at full resolution
+python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+python abus_train.py --max_epoch 1000
+
+# Generate segmentation predictions
+python abus_predict.py --model_path ./logs/segmamba_abus/model/best_model_XXXX.pt
+
+# Extract bounding boxes from masks
+python abus_seg_to_boxes.py \
+    --pred_dir ./prediction_results/segmamba_abus \
+    --abus_root /Volumes/Autzoko/ABUS \
+    --split Test
+
+# Evaluate detection
+python abus_det_compute_metrics.py \
+    --pred_file ./prediction_results/segmamba_abus/detections.json \
+    --abus_root /Volumes/Autzoko/ABUS --split Test
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--pred_dir` | `./prediction_results/segmamba_abus` | Directory with .nii.gz predictions |
+| `--abus_root` | `/Volumes/Autzoko/ABUS` | ABUS dataset root |
+| `--split` | `Test` | Dataset split |
+| `--min_volume` | `100` | Minimum component volume (filters noise) |
+
+This approach leverages the excellent full-resolution segmentation to derive
+accurate bounding boxes without training a separate detection head.

@@ -4,6 +4,22 @@ SegMamba-BoxHead Training Script for ABUS 3D Multi-task Learning.
 Multi-task: segmentation (Dice + CE) + attention-based box regression
 (SmoothL1 + GIoU) from SegMamba decoder features.
 
+IMPORTANT: This script uses 128^3 resized volumes for training.
+For full-resolution detection, use one of these approaches:
+
+Approach 1 - Two-Stage Training (Recommended):
+    1. Train segmentation at full resolution:
+       python abus_train.py  (4 min/epoch, full resolution)
+    2. Fine-tune BoxHead with frozen encoder/decoder:
+       python abus_boxhead_train.py --pretrained_seg ./logs/segmamba_abus/model/best_model.pt \
+                                    --freeze_backbone
+
+Approach 2 - Derive Boxes from Segmentation:
+    1. Train segmentation: python abus_train.py
+    2. Generate predictions: python abus_predict.py --model_path ...
+    3. Extract boxes: python abus_seg_to_boxes.py --pred_dir ./prediction_results/segmamba_abus
+    4. Evaluate: python abus_det_compute_metrics.py --pred_file .../detections.json
+
 Usage:
     python abus_boxhead_train.py --data_dir_train ./data/abus_boxhead/train \
                                   --data_dir_val ./data/abus_boxhead/val
@@ -338,6 +354,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pretrained_seg", type=str, default="",
                         help="Path to SegMamba segmentation checkpoint")
+    parser.add_argument("--freeze_backbone", action="store_true",
+                        help="Freeze encoder/decoder, only train BoxHead "
+                             "(use with --pretrained_seg for two-stage training)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -380,9 +399,20 @@ if __name__ == "__main__":
               f"{len(missing)} missing (BoxHead), "
               f"{len(unexpected)} unexpected")
 
+    # Freeze backbone if requested (two-stage training)
+    if args.freeze_backbone:
+        # Freeze all parameters except box_head
+        for name, param in model.named_parameters():
+            if 'box_head' not in name:
+                param.requires_grad = False
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  Frozen backbone: only {trainable/1e3:.1f}K BoxHead params trainable")
+
     # Optimiser: SGD with Poly LR (match segmentation pipeline)
+    # Only include parameters that require grad
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(
-        model.parameters(), lr=args.lr,
+        trainable_params, lr=args.lr,
         weight_decay=3e-5, momentum=0.99, nesterov=True)
     scheduler = PolyLRScheduler(optimizer, args.max_epoch)
     scaler = GradScaler()
