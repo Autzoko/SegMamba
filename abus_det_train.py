@@ -141,7 +141,7 @@ def train_one_epoch(model, loader, optimizer, device, scaler, epoch):
 
         optimizer.zero_grad()
 
-        with autocast('cuda'):
+        with autocast():
             all_cls, all_reg, all_ctr = model(volume)
 
             total_focal = torch.tensor(0.0, device=device)
@@ -216,7 +216,7 @@ def validate(model, loader, device, iou_thresh=0.25):
         gt_n = batch['num_boxes'].numpy()
         B = volume.shape[0]
 
-        with autocast('cuda'):
+        with autocast():
             all_cls, all_reg, all_ctr = model(volume)
 
         for b in range(B):

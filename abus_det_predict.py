@@ -56,7 +56,7 @@ def predict_all(model, data_dir, device, score_thresh=0.05,
         orig_shape = d['original_shape'].tolist()
         case_name = os.path.basename(fp).replace('.npz', '')
 
-        with autocast('cuda'):
+        with autocast():
             all_cls, all_reg, all_ctr = model(volume)
 
         boxes, scores = decode_detections(
