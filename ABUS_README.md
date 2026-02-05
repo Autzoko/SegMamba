@@ -1,11 +1,12 @@
 # SegMamba for ABUS 3D Ultrasound
 
-Four pipelines for the ABUS (Automated Breast Ultrasound) dataset:
+Five pipelines for the ABUS (Automated Breast Ultrasound) dataset:
 
 - **Pipeline A — Segmentation** (`abus_*.py`) — per-voxel tumour masks via SegMamba encoder-decoder
 - **Pipeline B — Detection FCOS** (`abus_det_*.py`) — 3D bounding boxes via MambaEncoder + FPN + FCOS head
 - **Pipeline C — Detection DETR** (`abus_detr_*.py`) — 3D bounding boxes via MambaEncoder + DETR transformer decoder
 - **Pipeline D — Multi-task BoxHead** (`abus_boxhead_*.py`) — segmentation + attention-based box regression from decoder features
+- **Pipeline E — Patch-Set Global Fusion** (`abus_patch_fusion_*.py`) — multi-task with differentiable patch-to-global box fusion (recommended)
 
 ---
 
@@ -417,6 +418,144 @@ python abus_boxhead_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
 python abus_boxhead_train.py
 python abus_boxhead_predict.py --model_path ./logs/segmamba_abus_boxhead/model/best_model_XXXX.pt
 python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abus_boxhead/detections.json --abus_root /Volumes/Autzoko/ABUS
+```
+
+---
+
+# Pipeline E — Patch-Set Global Fusion (Recommended)
+
+SegMamba with Patch-Set Global Fusion combines native patch-based segmentation
+training with end-to-end global detection optimization. **This is the recommended
+approach for multi-task segmentation + detection.**
+
+## Key Idea
+
+Each 128³ patch produces:
+- Segmentation logits (same as original SegMamba)
+- Local box prediction `b_i` (mapped to global coordinates)
+- Objectness score `o_i` (is target present in this patch?)
+- Quality score `q_i` (how reliable is this patch's prediction?)
+
+Multiple patches from the same volume are **fused via differentiable soft-weighted
+aggregation** into a single global box:
+
+```
+b_global = Σ(o_i × q_i × b_i) / Σ(o_i × q_i)
+```
+
+**Benefits:**
+- A patch doesn't need to fully contain the target to contribute
+- Network learns which patches are reliable via auxiliary supervision
+- End-to-end global detection without post-processing
+- Maintains native SegMamba segmentation accuracy
+- Robust to patch truncation at volume boundaries
+
+## Architecture
+
+```
+Input Patch (B, 1, 128, 128, 128)
+    │
+    ▼
+SegMamba Encoder-Decoder (unchanged)
+    │
+    ├─→ decoder1 (B, 48, 128, 128, 128)
+    │     │
+    │     ├─→ UnetOutBlock → Segmentation logits
+    │     │
+    │     └─→ PatchBoxHead:
+    │           Conv3d(48→64, s=1) + IN + ReLU
+    │           Conv3d(64→64, s=2) + IN + ReLU  (128→64)
+    │           Conv3d(64→64, s=2) + IN + ReLU  (64→32)
+    │           Global Avg Pool → (B, 64)
+    │           ├─→ MLP → box (B, 6)
+    │           ├─→ MLP → objectness (B, 1)
+    │           └─→ MLP → quality (B, 1)
+    │
+    ▼
+Global Fusion (across all patches from same volume):
+    boxes_global = transform_to_global(boxes_local, patch_positions)
+    fused_box = soft_weighted_average(boxes_global, objectness × quality)
+    │
+    ▼
+Losses:
+    seg_loss = DiceCE (per-patch, same as original)
+    det_loss = SmoothL1 + GIoU (fused_box vs GT_box)
+    obj_loss = BCE (objectness vs has_overlap)
+    qual_loss = MSE (quality vs centerness, for overlapping patches)
+```
+
+## Patch Fusion Step 1 — Preprocessing
+
+**Uses the same preprocessing as Pipeline A (original SegMamba).**
+
+```bash
+python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS --output_base ./data/abus
+```
+
+## Patch Fusion Step 2 — Training
+
+```bash
+python abus_patch_fusion_train.py --data_dir_train ./data/abus/train \
+                                   --data_dir_val ./data/abus/val
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--data_dir_train` | `./data/abus/train` | Training data directory |
+| `--data_dir_val` | `./data/abus/val` | Validation data directory |
+| `--logdir` | `./logs/segmamba_abus_patch_fusion` | Log and checkpoint directory |
+| `--max_epoch` | `1000` | Total training epochs |
+| `--patches_per_volume` | `4` | Number of patches sampled per volume |
+| `--val_every` | `5` | Validate every N epochs |
+| `--device` | `cuda:0` | GPU device |
+| `--lr` | `0.01` | Learning rate (SGD) |
+| `--pretrained_seg` | `""` | Path to pretrained SegMamba checkpoint |
+
+Monitor:
+```bash
+tensorboard --logdir ./logs/segmamba_abus_patch_fusion
+```
+
+## Patch Fusion Step 3 — Prediction
+
+```bash
+python abus_patch_fusion_predict.py \
+    --model_path ./logs/segmamba_abus_patch_fusion/model/best_model_XXXX.pt \
+    --save_seg
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--model_path` | **(required)** | Path to trained checkpoint |
+| `--data_dir_test` | `./data/abus/test` | Test data directory |
+| `--save_path` | `./prediction_results/segmamba_abus_patch_fusion` | Output directory |
+| `--save_seg` | (flag) | Also save segmentation masks as NIfTI |
+| `--overlap` | `0.5` | Sliding window overlap |
+
+Outputs:
+- `detections.json`: Detection boxes (one fused box per volume)
+- `*.nii.gz`: Segmentation masks (if `--save_seg`)
+
+## Patch Fusion Step 4 — Evaluation
+
+```bash
+# Segmentation metrics (Dice, HD95)
+python abus_compute_metrics.py --pred_name segmamba_abus_patch_fusion
+
+# Detection metrics (AP, IoU)
+python abus_det_compute_metrics.py \
+    --pred_file ./prediction_results/segmamba_abus_patch_fusion/detections.json \
+    --abus_root /Volumes/Autzoko/ABUS --split Test
+```
+
+## Patch Fusion Quick-Start
+
+```bash
+python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+python abus_patch_fusion_train.py
+python abus_patch_fusion_predict.py --model_path ./logs/segmamba_abus_patch_fusion/model/best_model_XXXX.pt --save_seg
+python abus_compute_metrics.py --pred_name segmamba_abus_patch_fusion
+python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abus_patch_fusion/detections.json --abus_root /Volumes/Autzoko/ABUS
 ```
 
 ---
