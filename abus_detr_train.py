@@ -27,7 +27,7 @@ from abus_detr_utils import (HungarianMatcher, SetCriterion,
                               prepare_detr_targets,
                               box_cxcyczdhwd_to_zyxzyx)
 from abus_det_train import ABUSDetDataset, det_collate_fn, load_pretrained_backbone
-from abus_det_utils import compute_ap_for_dataset
+from abus_det_utils import compute_detection_metrics
 
 INPUT_SIZE = 128
 
@@ -73,7 +73,11 @@ def train_one_epoch(model, criterion, loader, optimizer, device, scaler):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def validate(model, loader, device, iou_thresh=0.25, score_thresh=0.05):
+def validate(model, loader, device, score_thresh=0.05):
+    """Compute comprehensive detection metrics on the validation set.
+
+    Returns dict with AP@0.1/0.25/0.5, mAP, recall, mean IoU, mean GIoU.
+    """
     model.eval()
     all_pred_boxes, all_pred_scores, all_gt_boxes = [], [], []
 
@@ -103,10 +107,8 @@ def validate(model, loader, device, iou_thresh=0.25, score_thresh=0.05):
             all_pred_scores.append(scores[mask].astype(np.float32))
             all_gt_boxes.append(gt[b, :gt_n[b]])
 
-    ap = compute_ap_for_dataset(
-        all_pred_boxes, all_pred_scores, all_gt_boxes,
-        iou_threshold=iou_thresh)
-    return ap
+    return compute_detection_metrics(
+        all_pred_boxes, all_pred_scores, all_gt_boxes)
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +208,19 @@ if __name__ == "__main__":
         print(f"  [epoch {epoch:3d}]  loss={train_loss:.4f}  lr={lr_now:.6f}")
 
         if (epoch + 1) % args.val_every == 0:
-            ap25 = validate(model, val_loader, device, iou_thresh=0.25)
-            writer.add_scalar("val/AP@0.25", ap25, epoch)
-            print(f"             val AP@0.25 = {ap25:.4f}")
+            metrics = validate(model, val_loader, device)
+
+            for k, v in metrics.items():
+                writer.add_scalar(f"val/{k}", v, epoch)
+
+            ap25 = metrics['AP@0.25']
+            print(f"             AP@0.1={metrics['AP@0.1']:.4f}  "
+                  f"AP@0.25={ap25:.4f}  "
+                  f"AP@0.5={metrics['AP@0.5']:.4f}  "
+                  f"mAP={metrics['mAP']:.4f}")
+            print(f"             recall@0.25={metrics['recall@0.25']:.4f}  "
+                  f"mean_IoU={metrics['mean_best_iou']:.4f}  "
+                  f"mean_GIoU={metrics['mean_giou']:.4f}")
 
             if ap25 > best_ap:
                 best_ap = ap25

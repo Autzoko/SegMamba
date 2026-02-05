@@ -25,7 +25,8 @@ from torch.cuda.amp import GradScaler, autocast
 
 from model_segmamba.segmamba_det import SegMambaDet
 from abus_det_utils import (sigmoid_focal_loss, compute_fcos_targets,
-                            decode_detections, nms_3d, compute_ap_for_dataset)
+                            decode_detections, nms_3d,
+                            compute_detection_metrics)
 
 INPUT_SIZE = 128
 STRIDES = [2, 4, 8, 16]
@@ -206,7 +207,11 @@ def train_one_epoch(model, loader, optimizer, device, scaler, epoch):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def validate(model, loader, device, iou_thresh=0.25):
+def validate(model, loader, device):
+    """Compute comprehensive detection metrics on the validation set.
+
+    Returns dict with AP@0.1/0.25/0.5, mAP, recall, mean IoU, mean GIoU.
+    """
     model.eval()
     all_pred_boxes, all_pred_scores, all_gt_boxes = [], [], []
 
@@ -237,9 +242,8 @@ def validate(model, loader, device, iou_thresh=0.25):
             all_pred_scores.append(scores)
             all_gt_boxes.append(gt[b, :gt_n[b]])
 
-    ap = compute_ap_for_dataset(all_pred_boxes, all_pred_scores,
-                                all_gt_boxes, iou_threshold=iou_thresh)
-    return ap
+    return compute_detection_metrics(
+        all_pred_boxes, all_pred_scores, all_gt_boxes)
 
 
 # ---------------------------------------------------------------------------
@@ -340,16 +344,25 @@ if __name__ == "__main__":
         print(f"  [epoch {epoch:3d}]  loss={train_loss:.4f}  lr={lr_now:.6f}")
 
         if (epoch + 1) % args.val_every == 0:
-            ap25 = validate(model, val_loader, device, iou_thresh=0.25)
-            writer.add_scalar("val/AP@0.25", ap25, epoch)
-            print(f"             val AP@0.25 = {ap25:.4f}")
+            metrics = validate(model, val_loader, device)
+
+            for k, v in metrics.items():
+                writer.add_scalar(f"val/{k}", v, epoch)
+
+            ap25 = metrics['AP@0.25']
+            print(f"             AP@0.1={metrics['AP@0.1']:.4f}  "
+                  f"AP@0.25={ap25:.4f}  "
+                  f"AP@0.5={metrics['AP@0.5']:.4f}  "
+                  f"mAP={metrics['mAP']:.4f}")
+            print(f"             recall@0.25={metrics['recall@0.25']:.4f}  "
+                  f"mean_IoU={metrics['mean_best_iou']:.4f}  "
+                  f"mean_GIoU={metrics['mean_giou']:.4f}")
 
             if ap25 > best_ap:
                 best_ap = ap25
                 path = os.path.join(
                     model_save_dir, f"best_model_{ap25:.4f}.pt")
                 torch.save(model.state_dict(), path)
-                # Remove previous best
                 for f in glob.glob(
                         os.path.join(model_save_dir, "best_model_*.pt")):
                     if f != path:

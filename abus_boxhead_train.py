@@ -27,7 +27,7 @@ from monai.losses.dice import DiceLoss
 
 from model_segmamba.segmamba_boxhead import SegMambaWithBoxHead
 from abus_detr_utils import (generalized_box_iou_3d, box_cxcyczdhwd_to_zyxzyx)
-from abus_det_utils import compute_ap_for_dataset
+from abus_det_utils import compute_detection_metrics
 
 INPUT_SIZE = 128
 
@@ -225,10 +225,16 @@ def train_one_epoch(model, loader, optimizer, device, scaler,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def validate(model, loader, device, iou_thresh=0.25):
+def validate(model, loader, device):
+    """Compute comprehensive seg + det metrics on the validation set.
+
+    Segmentation:  Dice, Sensitivity (recall), Precision
+    Detection:     AP@0.1/0.25/0.5, mAP, recall@0.1/0.25/0.5,
+                   mean best IoU, mean GIoU
+    """
     model.eval()
     all_pred_boxes, all_pred_scores, all_gt_boxes = [], [], []
-    dice_scores = []
+    dice_list, sens_list, prec_list = [], [], []
 
     for batch in loader:
         volume = batch['data'].to(device)
@@ -240,28 +246,36 @@ def validate(model, loader, device, iou_thresh=0.25):
         with autocast():
             seg_logits, box_pred = model(volume)
 
-        # --- Seg dice ---
         seg_pred = seg_logits.argmax(dim=1)
-        for b in range(B):
-            pred_np = seg_pred[b].cpu().numpy()
-            gt_np = seg_gt[b].cpu().numpy()
-            if pred_np.sum() > 0 and gt_np.sum() > 0:
-                intersection = (pred_np * gt_np).sum()
-                d = 2.0 * intersection / (pred_np.sum() + gt_np.sum())
-            elif pred_np.sum() == 0 and gt_np.sum() == 0:
-                d = 1.0
-            else:
-                d = 0.0
-            dice_scores.append(d)
 
-        # --- Det AP ---
+        for b in range(B):
+            pred_np = seg_pred[b].cpu().numpy().astype(bool)
+            gt_np = seg_gt[b].cpu().numpy().astype(bool)
+
+            tp = float((pred_np & gt_np).sum())
+            fp = float((pred_np & ~gt_np).sum())
+            fn = float((~pred_np & gt_np).sum())
+
+            # Dice
+            if pred_np.sum() > 0 and gt_np.sum() > 0:
+                dice_list.append(2 * tp / (2 * tp + fp + fn))
+            elif not pred_np.any() and not gt_np.any():
+                dice_list.append(1.0)
+            else:
+                dice_list.append(0.0)
+
+            # Sensitivity = TP / (TP + FN)
+            sens_list.append(tp / max(tp + fn, 1))
+            # Precision = TP / (TP + FP)
+            prec_list.append(tp / max(tp + fp, 1))
+
+        # --- Det: collect predictions ---
         for b in range(B):
             bp = box_pred[b].cpu()
             bp_corner = box_cxcyczdhwd_to_zyxzyx(bp.unsqueeze(0))
             bp_abs = (bp_corner * INPUT_SIZE).numpy()
             bp_abs = np.clip(bp_abs, 0, INPUT_SIZE)
 
-            # Derive score from seg foreground fraction
             fg = float(seg_pred[b].sum().cpu())
             score = min(fg / (INPUT_SIZE ** 3) * 50.0, 1.0)
             score = max(score, 0.01)
@@ -270,11 +284,18 @@ def validate(model, loader, device, iou_thresh=0.25):
             all_pred_scores.append(np.array([score], dtype=np.float32))
             all_gt_boxes.append(gt_corners[b, :gt_n[b]])
 
-    mean_dice = float(np.mean(dice_scores)) if dice_scores else 0.0
-    ap = compute_ap_for_dataset(
-        all_pred_boxes, all_pred_scores, all_gt_boxes,
-        iou_threshold=iou_thresh)
-    return mean_dice, ap
+    # --- Aggregate ---
+    seg_metrics = {
+        'dice': float(np.mean(dice_list)) if dice_list else 0.0,
+        'sensitivity': float(np.mean(sens_list)) if sens_list else 0.0,
+        'precision': float(np.mean(prec_list)) if prec_list else 0.0,
+    }
+
+    det_metrics = compute_detection_metrics(
+        all_pred_boxes, all_pred_scores, all_gt_boxes)
+
+    return {**{'seg/' + k: v for k, v in seg_metrics.items()},
+            **{'det/' + k: v for k, v in det_metrics.items()}}
 
 
 # ---------------------------------------------------------------------------
@@ -389,10 +410,24 @@ if __name__ == "__main__":
               f"seg={seg_loss:.4f}  det={det_loss:.4f}  lr={lr_now:.6f}")
 
         if (epoch + 1) % args.val_every == 0:
-            mean_dice, ap25 = validate(model, val_loader, device)
-            writer.add_scalar("val/dice", mean_dice, epoch)
-            writer.add_scalar("val/AP@0.25", ap25, epoch)
-            print(f"             val dice={mean_dice:.4f}  AP@0.25={ap25:.4f}")
+            metrics = validate(model, val_loader, device)
+
+            for k, v in metrics.items():
+                writer.add_scalar(f"val/{k}", v, epoch)
+
+            ap25 = metrics['det/AP@0.25']
+            print(f"             --- Segmentation ---")
+            print(f"             Dice={metrics['seg/dice']:.4f}  "
+                  f"Sens={metrics['seg/sensitivity']:.4f}  "
+                  f"Prec={metrics['seg/precision']:.4f}")
+            print(f"             --- Detection ---")
+            print(f"             AP@0.1={metrics['det/AP@0.1']:.4f}  "
+                  f"AP@0.25={ap25:.4f}  "
+                  f"AP@0.5={metrics['det/AP@0.5']:.4f}  "
+                  f"mAP={metrics['det/mAP']:.4f}")
+            print(f"             recall@0.25={metrics['det/recall@0.25']:.4f}  "
+                  f"mean_IoU={metrics['det/mean_best_iou']:.4f}  "
+                  f"mean_GIoU={metrics['det/mean_giou']:.4f}")
 
             if ap25 > best_ap:
                 best_ap = ap25

@@ -329,3 +329,99 @@ def compute_ap_for_dataset(all_pred_boxes, all_pred_scores, all_gt_boxes,
     ap /= 11.0
 
     return ap
+
+
+# ---------------------------------------------------------------------------
+# 3D GIoU (single pair, numpy)
+# ---------------------------------------------------------------------------
+
+def compute_giou_3d_single(box1, box2):
+    """Compute Generalized IoU between two single 3D boxes.
+
+    Parameters
+    ----------
+    box1, box2 : np.ndarray (6,)  [z1, y1, x1, z2, y2, x2]
+
+    Returns
+    -------
+    giou : float in [-1, 1]
+    """
+    inter_z = max(0, min(box1[3], box2[3]) - max(box1[0], box2[0]))
+    inter_y = max(0, min(box1[4], box2[4]) - max(box1[1], box2[1]))
+    inter_x = max(0, min(box1[5], box2[5]) - max(box1[2], box2[2]))
+    inter = inter_z * inter_y * inter_x
+
+    vol1 = max(0, box1[3] - box1[0]) * max(0, box1[4] - box1[1]) * max(0, box1[5] - box1[2])
+    vol2 = max(0, box2[3] - box2[0]) * max(0, box2[4] - box2[1]) * max(0, box2[5] - box2[2])
+    union = vol1 + vol2 - inter
+    iou = inter / max(union, 1e-6)
+
+    enc_z = max(box1[3], box2[3]) - min(box1[0], box2[0])
+    enc_y = max(box1[4], box2[4]) - min(box1[1], box2[1])
+    enc_x = max(box1[5], box2[5]) - min(box1[2], box2[2])
+    enc_vol = enc_z * enc_y * enc_x
+
+    return iou - (enc_vol - union) / max(enc_vol, 1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Comprehensive detection metrics
+# ---------------------------------------------------------------------------
+
+def compute_detection_metrics(all_pred_boxes, all_pred_scores, all_gt_boxes):
+    """Compute comprehensive detection metrics across the dataset.
+
+    Returns
+    -------
+    dict with keys:
+        AP@0.1, AP@0.25, AP@0.5, mAP,
+        recall@0.1, recall@0.25, recall@0.5,
+        mean_best_iou, mean_giou
+    """
+    metrics = {}
+
+    # AP at multiple IoU thresholds
+    for thresh in [0.1, 0.25, 0.5]:
+        metrics[f'AP@{thresh}'] = compute_ap_for_dataset(
+            all_pred_boxes, all_pred_scores, all_gt_boxes,
+            iou_threshold=thresh)
+
+    metrics['mAP'] = np.mean([metrics['AP@0.1'], metrics['AP@0.25'],
+                              metrics['AP@0.5']])
+
+    # Per-GT-box: recall, best IoU, GIoU with best-matching prediction
+    total_gt = sum(len(gt) for gt in all_gt_boxes)
+    matched = {0.1: 0, 0.25: 0, 0.5: 0}
+    best_ious = []
+    giou_values = []
+
+    for pred_boxes, gt_boxes in zip(all_pred_boxes, all_gt_boxes):
+        if len(gt_boxes) == 0:
+            continue
+        if len(pred_boxes) == 0:
+            best_ious.extend([0.0] * len(gt_boxes))
+            giou_values.extend([-1.0] * len(gt_boxes))
+            continue
+
+        ious = compute_iou_3d(pred_boxes, gt_boxes)      # (K, M)
+
+        for j in range(len(gt_boxes)):
+            best_pred = ious[:, j].argmax()
+            best_iou = float(ious[best_pred, j])
+            best_ious.append(best_iou)
+
+            giou = compute_giou_3d_single(
+                pred_boxes[best_pred], gt_boxes[j])
+            giou_values.append(giou)
+
+            for t in [0.1, 0.25, 0.5]:
+                if best_iou >= t:
+                    matched[t] += 1
+
+    for t in [0.1, 0.25, 0.5]:
+        metrics[f'recall@{t}'] = matched[t] / max(total_gt, 1)
+
+    metrics['mean_best_iou'] = float(np.mean(best_ious)) if best_ious else 0.0
+    metrics['mean_giou'] = float(np.mean(giou_values)) if giou_values else 0.0
+
+    return metrics
