@@ -226,3 +226,87 @@ python abus_det_train.py
 python abus_det_predict.py --model_path ./logs/segmamba_abus_det/model/best_model_XXXX.pt
 python abus_det_compute_metrics.py --abus_root /Volumes/Autzoko/ABUS
 ```
+
+---
+
+# Pipeline C — Detection with DETR (SegMamba-DETR)
+
+SegMamba-DETR replaces the FPN + FCOS head from Pipeline B with a DETR-style
+transformer encoder-decoder. Learned object queries directly output a fixed-size
+set of (class, box) predictions via Hungarian matching — **no NMS required**.
+
+Architecture: `MambaEncoder (level 3, 8^3) → 1×1 proj → Transformer Encoder (4L) → Transformer Decoder (4L, 20 queries) → Class + Box heads`
+
+## DETR Step 1 — Preprocessing
+
+**Same as Pipeline B.** Uses `abus_det_preprocessing.py`.
+
+```bash
+python abus_det_preprocessing.py --abus_root /Volumes/Autzoko/ABUS --output_base ./data/abus_det
+```
+
+## DETR Step 2 — Training
+
+```bash
+python abus_detr_train.py --data_dir_train ./data/abus_det/train --data_dir_val ./data/abus_det/val
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--data_dir_train` | `./data/abus_det/train` | Training data directory |
+| `--data_dir_val` | `./data/abus_det/val` | Validation data directory |
+| `--logdir` | `./logs/segmamba_abus_detr` | Log and checkpoint directory |
+| `--max_epoch` | `300` | Total training epochs |
+| `--batch_size` | `2` | Per-GPU batch size |
+| `--val_every` | `5` | Validate every N epochs |
+| `--device` | `cuda:0` | GPU device |
+| `--lr` | `0.0001` | Learning rate (AdamW) |
+| `--num_queries` | `20` | Learned object queries |
+| `--d_model` | `256` | Transformer hidden dimension |
+| `--nhead` | `8` | Attention heads |
+| `--enc_layers` | `4` | Transformer encoder layers |
+| `--dec_layers` | `4` | Transformer decoder layers |
+| `--dim_feedforward` | `1024` | FFN intermediate dimension |
+| `--pretrained_backbone` | `""` | Path to segmentation checkpoint to init MambaEncoder |
+
+Monitor:
+```bash
+tensorboard --logdir ./logs/segmamba_abus_detr
+```
+
+## DETR Step 3 — Prediction
+
+```bash
+python abus_detr_predict.py --model_path ./logs/segmamba_abus_detr/model/best_model_XXXX.pt
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--model_path` | **(required)** | Path to trained checkpoint |
+| `--data_dir_test` | `./data/abus_det/test` | Test data directory |
+| `--save_path` | `./prediction_results/segmamba_abus_detr` | Output directory |
+| `--device` | `cuda:0` | GPU device |
+| `--score_thresh` | `0.05` | Score filter threshold |
+
+Output: `./prediction_results/segmamba_abus_detr/detections.json`
+
+## DETR Step 4 — Evaluation
+
+**Same as Pipeline B.** Uses `abus_det_compute_metrics.py`.
+
+```bash
+python abus_det_compute_metrics.py \
+    --pred_file ./prediction_results/segmamba_abus_detr/detections.json \
+    --abus_root /Volumes/Autzoko/ABUS --split Test
+```
+
+Reports **AP@0.1**, **AP@0.25**, **AP@0.5**, recall, and mean best IoU.
+
+## DETR Quick-Start
+
+```bash
+python abus_det_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+python abus_detr_train.py
+python abus_detr_predict.py --model_path ./logs/segmamba_abus_detr/model/best_model_XXXX.pt
+python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abus_detr/detections.json --abus_root /Volumes/Autzoko/ABUS
+```
