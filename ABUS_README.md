@@ -1,8 +1,9 @@
-# SegMamba for ABUS 3D Ultrasound Tumour Segmentation
+# SegMamba for ABUS 3D Ultrasound
 
-Train and evaluate SegMamba on the ABUS (Automated Breast Ultrasound) dataset
-for binary tumour segmentation. Four scripts handle the full pipeline:
-preprocessing, training, prediction, and evaluation.
+Two pipelines for the ABUS (Automated Breast Ultrasound) dataset:
+
+- **Segmentation** (`abus_*.py`) — per-voxel tumour masks via SegMamba encoder-decoder
+- **Detection** (`abus_det_*.py`) — direct 3D bounding box prediction via SegMamba-Det (MambaEncoder + FPN + FCOS head)
 
 ---
 
@@ -19,7 +20,7 @@ cd mamba         && python setup.py install && cd ..
 ### 2. Install Python packages
 
 ```bash
-pip install acvl-utils medpy SimpleITK tqdm scikit-image batchgenerators
+pip install acvl-utils medpy SimpleITK tqdm scikit-image batchgenerators einops
 ```
 
 > Do **not** `pip install monai` — it is bundled in the repo.
@@ -31,6 +32,8 @@ python 0_inference.py
 ```
 
 ---
+
+# Pipeline A — Segmentation
 
 ## Step 1 — Preprocessing
 
@@ -118,24 +121,108 @@ Reports per-case and mean **Dice** and **HD95**.
 
 ---
 
-## Quick-Start (all commands)
+## Segmentation Quick-Start
 
 ```bash
-# Environment
-cd SegMamba
-cd causal-conv1d && python setup.py install && cd ..
-cd mamba         && python setup.py install && cd ..
-pip install acvl-utils medpy SimpleITK tqdm scikit-image batchgenerators
-
-# Preprocessing
 python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
-
-# Training
 python abus_train.py
-
-# Prediction
 python abus_predict.py --model_path ./logs/segmamba_abus/model/best_model_XXXX.pt
-
-# Evaluation
 python abus_compute_metrics.py
+```
+
+---
+
+# Pipeline B — Detection (SegMamba-Det)
+
+SegMamba-Det reuses the MambaEncoder backbone from SegMamba and replaces
+the UNETR decoder with an FPN neck + FCOS-style 3D anchor-free detection
+head. It predicts bounding boxes directly (not derived from masks).
+
+Architecture: `MambaEncoder → FPN3D → FCOS3DHead`
+
+The entire volume is resized to 128^3 for detection (required by
+MambaEncoder's hardcoded `num_slices_list`).
+
+## Det Step 1 — Preprocessing
+
+Derive bounding-box GT from segmentation masks, resize volumes to 128^3.
+
+```bash
+python abus_det_preprocessing.py --abus_root /Volumes/Autzoko/ABUS --output_base ./data/abus_det
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--abus_root` | `/Volumes/Autzoko/ABUS` | Path to raw ABUS dataset |
+| `--output_base` | `./data/abus_det` | Output directory |
+
+Output:
+```
+./data/abus_det/{train,val,test}/ABUS_XXX.npz
+```
+
+Each NPZ contains: `data` (1,128,128,128), `boxes` (N,6), `original_shape`, `spacing`.
+
+## Det Step 2 — Training
+
+```bash
+python abus_det_train.py --data_dir_train ./data/abus_det/train --data_dir_val ./data/abus_det/val
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--data_dir_train` | `./data/abus_det/train` | Training data directory |
+| `--data_dir_val` | `./data/abus_det/val` | Validation data directory |
+| `--logdir` | `./logs/segmamba_abus_det` | Log and checkpoint directory |
+| `--max_epoch` | `300` | Total training epochs |
+| `--batch_size` | `2` | Per-GPU batch size |
+| `--val_every` | `5` | Validate every N epochs |
+| `--device` | `cuda:0` | GPU device |
+| `--lr` | `0.0001` | Learning rate (AdamW) |
+| `--num_workers` | `4` | Data loader workers |
+| `--pretrained_backbone` | `""` | Optional: path to segmentation checkpoint to init MambaEncoder |
+
+Monitor:
+```bash
+tensorboard --logdir ./logs/segmamba_abus_det
+```
+
+## Det Step 3 — Prediction
+
+```bash
+python abus_det_predict.py --model_path ./logs/segmamba_abus_det/model/best_model_XXXX.pt
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--model_path` | **(required)** | Path to trained checkpoint |
+| `--data_dir_test` | `./data/abus_det/test` | Test data directory |
+| `--save_path` | `./prediction_results/segmamba_abus_det` | Output directory |
+| `--device` | `cuda:0` | GPU device |
+| `--score_thresh` | `0.05` | Score filter threshold |
+| `--nms_thresh` | `0.3` | NMS IoU threshold |
+
+Output: `./prediction_results/segmamba_abus_det/detections.json`
+
+## Det Step 4 — Evaluation
+
+```bash
+python abus_det_compute_metrics.py --abus_root /Volumes/Autzoko/ABUS --split Test
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--pred_file` | `./prediction_results/segmamba_abus_det/detections.json` | Predictions file |
+| `--abus_root` | `/Volumes/Autzoko/ABUS` | Raw dataset root (for GT masks) |
+| `--split` | `Test` | `Train`, `Validation`, or `Test` |
+
+Reports **AP@0.1**, **AP@0.25**, **AP@0.5**, recall, and mean best IoU.
+
+## Detection Quick-Start
+
+```bash
+python abus_det_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+python abus_det_train.py
+python abus_det_predict.py --model_path ./logs/segmamba_abus_det/model/best_model_XXXX.pt
+python abus_det_compute_metrics.py --abus_root /Volumes/Autzoko/ABUS
 ```
