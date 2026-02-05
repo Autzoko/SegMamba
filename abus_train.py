@@ -32,22 +32,9 @@ from light_training.utils.files_helper import save_new_model_and_delete_last
 set_determinism(123)
 
 # ---------------------------------------------------------------------------
-# Paths & hyper-parameters
+# Defaults (overridden by command-line args)
 # ---------------------------------------------------------------------------
-data_dir_train = "./data/abus/train"
-data_dir_val   = "./data/abus/val"
-
-logdir          = "./logs/segmamba_abus"
-model_save_path = os.path.join(logdir, "model")
-
-augmentation = True          # full augmentation (spatial + intensity + mirror)
-env          = "pytorch"     # single-GPU
-max_epoch    = 1000
-batch_size   = 2
-val_every    = 2
-num_gpus     = 1
-device       = "cuda:0"
-roi_size     = [128, 128, 128]
+roi_size = [128, 128, 128]
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +45,8 @@ class ABUSTrainer(Trainer):
     def __init__(self, env_type, max_epochs, batch_size, device="cpu",
                  val_every=1, num_gpus=1, logdir="./logs/",
                  master_ip='localhost', master_port=17750,
-                 training_script="train.py"):
+                 training_script="train.py",
+                 lr=1e-2, num_workers=8):
         super().__init__(env_type, max_epochs, batch_size, device, val_every,
                          num_gpus, logdir, master_ip, master_port,
                          training_script)
@@ -67,7 +55,7 @@ class ABUSTrainer(Trainer):
         self.window_infer = SlidingWindowInferer(
             roi_size=roi_size, sw_batch_size=1, overlap=0.5)
 
-        self.augmentation = augmentation
+        self.augmentation = True
 
         # --- model ---
         from model_segmamba.segmamba import SegMamba
@@ -80,6 +68,7 @@ class ABUSTrainer(Trainer):
 
         self.patch_size = roi_size
         self.best_mean_dice = 0.0
+        self.model_save_path = os.path.join(logdir, "model")
 
         # --- loss ---
         self.ce = nn.CrossEntropyLoss()
@@ -92,7 +81,7 @@ class ABUSTrainer(Trainer):
         # --- optimiser ---
         self.optimizer = torch.optim.SGD(
             self.model.parameters(),
-            lr=1e-2,
+            lr=lr,
             weight_decay=3e-5,
             momentum=0.99,
             nesterov=True,
@@ -100,7 +89,7 @@ class ABUSTrainer(Trainer):
         self.scheduler_type = "poly"
 
         # data-loader workers (reduce if OOM)
-        self.train_process = 8
+        self.train_process = num_workers
 
     # -----------------------------------------------------------------------
     # data helpers
@@ -163,20 +152,20 @@ class ABUSTrainer(Trainer):
             self.best_mean_dice = mean_dice
             save_new_model_and_delete_last(
                 self.model,
-                os.path.join(model_save_path,
+                os.path.join(self.model_save_path,
                              f"best_model_{mean_dice:.4f}.pt"),
                 delete_symbol="best_model")
 
         save_new_model_and_delete_last(
             self.model,
-            os.path.join(model_save_path,
+            os.path.join(self.model_save_path,
                          f"final_model_{mean_dice:.4f}.pt"),
             delete_symbol="final_model")
 
         if (self.epoch + 1) % 100 == 0:
             torch.save(
                 self.model.state_dict(),
-                os.path.join(model_save_path,
+                os.path.join(self.model_save_path,
                              f"tmp_model_ep{self.epoch}_{mean_dice:.4f}.pt"))
 
 
@@ -185,19 +174,48 @@ class ABUSTrainer(Trainer):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Train SegMamba on ABUS dataset")
+    parser.add_argument("--data_dir_train", type=str,
+                        default="./data/abus/train",
+                        help="Preprocessed training data directory")
+    parser.add_argument("--data_dir_val", type=str,
+                        default="./data/abus/val",
+                        help="Preprocessed validation data directory")
+    parser.add_argument("--logdir", type=str,
+                        default="./logs/segmamba_abus",
+                        help="Log and checkpoint directory")
+    parser.add_argument("--max_epoch", type=int, default=1000,
+                        help="Total training epochs")
+    parser.add_argument("--batch_size", type=int, default=2,
+                        help="Per-GPU batch size")
+    parser.add_argument("--val_every", type=int, default=2,
+                        help="Validate every N epochs")
+    parser.add_argument("--device", type=str, default="cuda:0",
+                        help="GPU device")
+    parser.add_argument("--lr", type=float, default=1e-2,
+                        help="Initial learning rate")
+    parser.add_argument("--num_workers", type=int, default=8,
+                        help="Data loader workers")
+    args = parser.parse_args()
+
     trainer = ABUSTrainer(
-        env_type=env,
-        max_epochs=max_epoch,
-        batch_size=batch_size,
-        device=device,
-        logdir=logdir,
-        val_every=val_every,
-        num_gpus=num_gpus,
+        env_type="pytorch",
+        max_epochs=args.max_epoch,
+        batch_size=args.batch_size,
+        device=args.device,
+        logdir=args.logdir,
+        val_every=args.val_every,
+        num_gpus=1,
         master_port=17760,
         training_script=__file__,
+        lr=args.lr,
+        num_workers=args.num_workers,
     )
 
     train_ds, val_ds, _ = get_train_val_test_loader_seperate(
-        data_dir_train, data_dir_val)
+        args.data_dir_train, args.data_dir_val)
 
     trainer.train(train_dataset=train_ds, val_dataset=val_ds)

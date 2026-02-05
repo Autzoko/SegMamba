@@ -301,19 +301,26 @@ def process_split(abus_root, split_name, output_dir, num_processes=4):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    abus_root = "/Volumes/Autzoko/ABUS"
-    output_base = "./data/abus"
+    import argparse
 
-    # Number of parallel workers.  Reduce if running out of RAM (each
-    # worker loads a full 3D volume into memory).
-    num_processes = 4
+    parser = argparse.ArgumentParser(
+        description="ABUS preprocessing: NRRD -> NPZ for SegMamba")
+    parser.add_argument("--abus_root", type=str,
+                        default="/Volumes/Autzoko/ABUS",
+                        help="Path to raw ABUS dataset root")
+    parser.add_argument("--output_base", type=str,
+                        default="./data/abus",
+                        help="Output directory for preprocessed files")
+    parser.add_argument("--num_processes", type=int, default=4,
+                        help="Parallel workers (reduce if OOM)")
+    args = parser.parse_args()
 
-    process_split(abus_root, "Train",
-                  os.path.join(output_base, "train"), num_processes)
-    process_split(abus_root, "Validation",
-                  os.path.join(output_base, "val"), num_processes)
-    process_split(abus_root, "Test",
-                  os.path.join(output_base, "test"), num_processes)
+    process_split(args.abus_root, "Train",
+                  os.path.join(args.output_base, "train"), args.num_processes)
+    process_split(args.abus_root, "Validation",
+                  os.path.join(args.output_base, "val"), args.num_processes)
+    process_split(args.abus_root, "Test",
+                  os.path.join(args.output_base, "test"), args.num_processes)
 
     print("=" * 60)
     print("  All preprocessing complete!")

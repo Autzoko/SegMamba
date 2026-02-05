@@ -6,12 +6,11 @@ on preprocessed ABUS test data and saves binary segmentation masks
 as NIfTI (.nii.gz) files.
 
 Usage:
-    python abus_predict.py
+    python abus_predict.py --model_path ./logs/segmamba_abus/model/best_model_0.XXXX.pt
 
 Prerequisites:
     1.  Run  abus_preprocessing.py   (creates ./data/abus/test/*.npz)
     2.  Run  abus_train.py           (creates model checkpoint)
-    3.  Update  model_path  below to point to the trained checkpoint.
 """
 
 import os
@@ -29,22 +28,6 @@ from light_training.prediction import Predictor
 
 set_determinism(123)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-data_dir_test = "./data/abus/test"
-
-# >>> UPDATE THIS PATH to your trained model checkpoint <<<
-model_path = "./logs/segmamba_abus/model/best_model_0.0000.pt"
-
-save_path = "./prediction_results/segmamba_abus"
-
-env        = "pytorch"
-max_epoch  = 1
-batch_size = 1
-val_every  = 1
-num_gpus   = 1
-device     = "cuda:0"
 patch_size = [128, 128, 128]
 
 
@@ -56,12 +39,16 @@ class ABUSPredictor(Trainer):
     def __init__(self, env_type, max_epochs, batch_size, device="cpu",
                  val_every=1, num_gpus=1, logdir="./logs/",
                  master_ip='localhost', master_port=17750,
-                 training_script="train.py"):
+                 training_script="train.py",
+                 model_path="", save_path=""):
         super().__init__(env_type, max_epochs, batch_size, device, val_every,
                          num_gpus, logdir, master_ip, master_port,
                          training_script)
         self.patch_size = patch_size
         self.augmentation = False
+        self.model_path = model_path
+        self.save_path = save_path
+        self.device_name = device
 
     # -----------------------------------------------------------------------
     # model + predictor setup
@@ -76,7 +63,7 @@ class ABUSPredictor(Trainer):
         )
 
         new_sd = self.filte_state_dict(
-            torch.load(model_path, map_location="cpu"))
+            torch.load(self.model_path, map_location="cpu"))
         model.load_state_dict(new_sd)
         model.eval()
 
@@ -93,7 +80,7 @@ class ABUSPredictor(Trainer):
             mirror_axes=[0, 1, 2],
         )
 
-        os.makedirs(save_path, exist_ok=True)
+        os.makedirs(self.save_path, exist_ok=True)
         return model, predictor
 
     # -----------------------------------------------------------------------
@@ -127,7 +114,7 @@ class ABUSPredictor(Trainer):
 
         # --- sliding-window + TTA ---
         model_output = predictor.maybe_mirror_and_predict(
-            image, model, device=device)
+            image, model, device=self.device_name)
 
         # --- resample to pre-resample shape ---
         model_output = predictor.predict_raw_probability(
@@ -168,7 +155,7 @@ class ABUSPredictor(Trainer):
             full_output,
             raw_spacing=raw_spacing,
             case_name=case_name,
-            save_dir=save_path,
+            save_dir=self.save_path,
         )
         return d
 
@@ -178,10 +165,26 @@ class ABUSPredictor(Trainer):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="SegMamba inference on ABUS test set")
+    parser.add_argument("--data_dir_test", type=str,
+                        default="./data/abus/test",
+                        help="Preprocessed test data directory")
+    parser.add_argument("--model_path", type=str, required=True,
+                        help="Path to trained model checkpoint")
+    parser.add_argument("--save_path", type=str,
+                        default="./prediction_results/segmamba_abus",
+                        help="Output directory for predictions")
+    parser.add_argument("--device", type=str, default="cuda:0",
+                        help="GPU device")
+    args = parser.parse_args()
+
     # --- build test dataset (with seg for evaluation) ---
-    test_datalist = sorted(glob.glob(f"{data_dir_test}/*.npz"))
+    test_datalist = sorted(glob.glob(f"{args.data_dir_test}/*.npz"))
     if len(test_datalist) == 0:
-        print(f"No test data found in {data_dir_test}. "
+        print(f"No test data found in {args.data_dir_test}. "
               "Run abus_preprocessing.py first.")
         exit(1)
 
@@ -190,19 +193,21 @@ if __name__ == "__main__":
 
     # --- predictor ---
     predictor_trainer = ABUSPredictor(
-        env_type=env,
-        max_epochs=max_epoch,
-        batch_size=batch_size,
-        device=device,
+        env_type="pytorch",
+        max_epochs=1,
+        batch_size=1,
+        device=args.device,
         logdir="",
-        val_every=val_every,
-        num_gpus=num_gpus,
+        val_every=1,
+        num_gpus=1,
         master_port=17761,
         training_script=__file__,
+        model_path=args.model_path,
+        save_path=args.save_path,
     )
 
     v_mean, val_outputs = predictor_trainer.validation_single_gpu(test_ds)
     print(f"\n{'='*60}")
     print(f"  Mean Dice on test set = {v_mean}")
-    print(f"  Predictions saved to  {save_path}/")
+    print(f"  Predictions saved to  {args.save_path}/")
     print(f"{'='*60}")
