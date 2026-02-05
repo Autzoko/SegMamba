@@ -9,9 +9,7 @@ connected component analysis. This allows full-resolution detection by:
 4. Evaluating with abus_det_compute_metrics.py
 
 Usage:
-    python abus_seg_to_boxes.py --pred_dir ./prediction_results/segmamba_abus \
-                                --abus_root /Volumes/Autzoko/ABUS \
-                                --split Test
+    python abus_seg_to_boxes.py --pred_dir ./prediction_results/segmamba_abus
 
 Output: detections.json in the same format as abus_det_predict.py
 """
@@ -37,14 +35,17 @@ def extract_boxes_from_mask(mask):
     -------
     boxes : np.ndarray (N, 6)
         Bounding boxes [z1, y1, x1, z2, y2, x2]
+    volumes : list
+        Volume of each connected component (for confidence scoring)
     """
     if mask.sum() == 0:
-        return np.zeros((0, 6), dtype=np.float32)
+        return np.zeros((0, 6), dtype=np.float32), []
 
     # Label connected components
     labeled, num_features = ndimage.label(mask)
 
     boxes = []
+    volumes = []
     for i in range(1, num_features + 1):
         component = (labeled == i)
         indices = np.where(component)
@@ -56,24 +57,12 @@ def extract_boxes_from_mask(mask):
         z2, y2, x2 = indices[0].max() + 1, indices[1].max() + 1, indices[2].max() + 1
 
         boxes.append([z1, y1, x1, z2, y2, x2])
+        volumes.append(int(component.sum()))
 
     if len(boxes) == 0:
-        return np.zeros((0, 6), dtype=np.float32)
+        return np.zeros((0, 6), dtype=np.float32), []
 
-    return np.array(boxes, dtype=np.float32)
-
-
-def get_case_ids(abus_root, split):
-    """Get case IDs for a given split."""
-    split_dir = os.path.join(abus_root, split)
-    case_ids = []
-
-    for name in sorted(os.listdir(split_dir)):
-        case_path = os.path.join(split_dir, name)
-        if os.path.isdir(case_path):
-            case_ids.append(name)
-
-    return case_ids
+    return np.array(boxes, dtype=np.float32), volumes
 
 
 def main():
@@ -82,12 +71,6 @@ def main():
     parser.add_argument("--pred_dir", type=str,
                         default="./prediction_results/segmamba_abus",
                         help="Directory with segmentation predictions (.nii.gz)")
-    parser.add_argument("--abus_root", type=str,
-                        default="/Volumes/Autzoko/ABUS",
-                        help="ABUS dataset root (for case IDs)")
-    parser.add_argument("--split", type=str, default="Test",
-                        choices=["Train", "Validation", "Test"],
-                        help="Dataset split")
     parser.add_argument("--output_file", type=str, default="",
                         help="Output JSON path (default: pred_dir/detections.json)")
     parser.add_argument("--min_volume", type=int, default=100,
@@ -98,49 +81,49 @@ def main():
     if not output_file:
         output_file = os.path.join(args.pred_dir, "detections.json")
 
-    case_ids = get_case_ids(args.abus_root, args.split)
-    print(f"Found {len(case_ids)} cases in {args.split} split")
+    # Find all prediction files (same pattern as abus_compute_metrics.py)
+    pred_files = sorted([
+        f for f in os.listdir(args.pred_dir) if f.endswith('.nii.gz')
+    ])
+
+    if len(pred_files) == 0:
+        print(f"No .nii.gz files found in {args.pred_dir}")
+        print("Run abus_predict.py first to generate segmentation predictions.")
+        return
+
+    print(f"Found {len(pred_files)} predictions in {args.pred_dir}")
 
     all_detections = {}
 
-    for case_id in tqdm(case_ids, desc="Extracting boxes"):
-        # Try different naming conventions
-        pred_path = None
-        for pattern in [f"ABUS_{case_id}.nii.gz", f"{case_id}.nii.gz"]:
-            candidate = os.path.join(args.pred_dir, pattern)
-            if os.path.exists(candidate):
-                pred_path = candidate
-                break
-
-        if pred_path is None:
-            print(f"Warning: No prediction found for {case_id}")
-            all_detections[case_id] = {"boxes": [], "scores": []}
-            continue
+    for pf in tqdm(pred_files, desc="Extracting boxes"):
+        # Extract case name: ABUS_130.nii.gz -> ABUS_130
+        case_name = pf.replace(".nii.gz", "")
+        # Extract case ID for JSON key: ABUS_130 -> 130
+        case_id = case_name.replace("ABUS_", "")
 
         # Load prediction
+        pred_path = os.path.join(args.pred_dir, pf)
         nii = nib.load(pred_path)
         mask = nii.get_fdata().astype(np.uint8)
 
-        # Filter small components
-        if args.min_volume > 0:
-            labeled, num_features = ndimage.label(mask)
-            for i in range(1, num_features + 1):
-                if (labeled == i).sum() < args.min_volume:
-                    mask[labeled == i] = 0
+        # Extract boxes with volume filtering
+        boxes, volumes = extract_boxes_from_mask(mask)
 
-        # Extract boxes
-        boxes = extract_boxes_from_mask(mask)
+        # Filter small components
+        if args.min_volume > 0 and len(boxes) > 0:
+            keep = [i for i, v in enumerate(volumes) if v >= args.min_volume]
+            boxes = boxes[keep] if len(keep) > 0 else np.zeros((0, 6), dtype=np.float32)
+            volumes = [volumes[i] for i in keep]
 
         # Compute confidence scores based on component volume
         scores = []
-        if len(boxes) > 0:
-            labeled, _ = ndimage.label(mask)
-            for i, box in enumerate(boxes, 1):
-                component_volume = (labeled == i).sum()
-                # Normalize score by typical tumor volume (heuristic)
-                score = min(1.0, component_volume / 10000.0)
-                scores.append(float(score))
+        for vol in volumes:
+            # Normalize score by typical tumor volume (heuristic)
+            # Larger components get higher scores, capped at 1.0
+            score = min(1.0, vol / 10000.0)
+            scores.append(float(max(score, 0.01)))
 
+        # Use case_id as key (matches abus_det_compute_metrics.py format)
         all_detections[case_id] = {
             "boxes": boxes.tolist(),
             "scores": scores
@@ -155,11 +138,10 @@ def main():
     total_boxes = sum(len(d["boxes"]) for d in all_detections.values())
     cases_with_boxes = sum(1 for d in all_detections.values() if len(d["boxes"]) > 0)
 
-    print(f"\nSaved {total_boxes} boxes from {cases_with_boxes}/{len(case_ids)} cases")
+    print(f"\nExtracted {total_boxes} boxes from {cases_with_boxes}/{len(pred_files)} cases")
     print(f"Output: {output_file}")
     print(f"\nEvaluate with:")
-    print(f"  python abus_det_compute_metrics.py --pred_file {output_file} "
-          f"--abus_root {args.abus_root} --split {args.split}")
+    print(f"  python abus_det_compute_metrics.py --pred_file {output_file}")
 
 
 if __name__ == "__main__":

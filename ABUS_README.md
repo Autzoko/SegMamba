@@ -423,52 +423,28 @@ python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abu
 
 # Full-Resolution Detection
 
-The standard detection pipelines (B, C, D) resize volumes to 128³, which may lose
-fine detail. For full-resolution detection, use one of these approaches:
+The standard detection pipelines (B, C, D) resize volumes to 128³. For full-resolution
+detection, derive bounding boxes from segmentation predictions.
 
-## Approach 1: Two-Stage Training (BoxHead)
+## Seg-to-Boxes: Extract Boxes from Segmentation (Recommended)
 
-Train segmentation at full resolution first, then fine-tune only the BoxHead on
-128³ data with frozen encoder/decoder.
-
-```bash
-# Stage 1: Train segmentation at full resolution (~4 min/epoch)
-python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
-python abus_train.py --max_epoch 1000
-
-# Stage 2: Fine-tune BoxHead only (~30 sec/epoch)
-python abus_boxhead_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
-python abus_boxhead_train.py \
-    --pretrained_seg ./logs/segmamba_abus/model/best_model_XXXX.pt \
-    --freeze_backbone \
-    --max_epoch 200
-
-# Predict and evaluate
-python abus_boxhead_predict.py --model_path ./logs/segmamba_abus_boxhead/model/best_model_XXXX.pt
-python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abus_boxhead/detections.json --abus_root /Volumes/Autzoko/ABUS
-```
-
-## Approach 2: Derive Boxes from Segmentation
-
-Train segmentation at full resolution and extract bounding boxes from the
-predicted masks using connected component analysis. No separate detection head
-needed.
+Uses the exact same pipeline as original SegMamba, with one additional step to
+extract bounding boxes from the predicted masks via connected component analysis.
 
 ```bash
-# Train segmentation at full resolution
+# Step 1: Preprocessing (same as original SegMamba)
 python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+
+# Step 2: Training (same as original SegMamba)
 python abus_train.py --max_epoch 1000
 
-# Generate segmentation predictions
+# Step 3: Prediction (same as original SegMamba)
 python abus_predict.py --model_path ./logs/segmamba_abus/model/best_model_XXXX.pt
 
-# Extract bounding boxes from masks
-python abus_seg_to_boxes.py \
-    --pred_dir ./prediction_results/segmamba_abus \
-    --abus_root /Volumes/Autzoko/ABUS \
-    --split Test
+# Step 4: Extract bounding boxes from segmentation masks (NEW)
+python abus_seg_to_boxes.py --pred_dir ./prediction_results/segmamba_abus
 
-# Evaluate detection
+# Step 5: Evaluate detection metrics
 python abus_det_compute_metrics.py \
     --pred_file ./prediction_results/segmamba_abus/detections.json \
     --abus_root /Volumes/Autzoko/ABUS --split Test
@@ -477,9 +453,27 @@ python abus_det_compute_metrics.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--pred_dir` | `./prediction_results/segmamba_abus` | Directory with .nii.gz predictions |
-| `--abus_root` | `/Volumes/Autzoko/ABUS` | ABUS dataset root |
-| `--split` | `Test` | Dataset split |
+| `--output_file` | `{pred_dir}/detections.json` | Output JSON path |
 | `--min_volume` | `100` | Minimum component volume (filters noise) |
 
-This approach leverages the excellent full-resolution segmentation to derive
-accurate bounding boxes without training a separate detection head.
+This approach leverages full-resolution segmentation to derive accurate bounding
+boxes without any changes to the original SegMamba training pipeline.
+
+---
+
+## Alternative: Two-Stage BoxHead Training
+
+For learned box regression (rather than mask-derived boxes), use two-stage training:
+
+```bash
+# Stage 1: Train segmentation at full resolution
+python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+python abus_train.py --max_epoch 1000
+
+# Stage 2: Fine-tune BoxHead with frozen backbone (uses 128³ resized data)
+python abus_boxhead_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+python abus_boxhead_train.py \
+    --pretrained_seg ./logs/segmamba_abus/model/best_model_XXXX.pt \
+    --freeze_backbone \
+    --max_epoch 200
+```
