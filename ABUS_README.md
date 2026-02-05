@@ -1,9 +1,11 @@
 # SegMamba for ABUS 3D Ultrasound
 
-Two pipelines for the ABUS (Automated Breast Ultrasound) dataset:
+Four pipelines for the ABUS (Automated Breast Ultrasound) dataset:
 
-- **Segmentation** (`abus_*.py`) — per-voxel tumour masks via SegMamba encoder-decoder
-- **Detection** (`abus_det_*.py`) — direct 3D bounding box prediction via SegMamba-Det (MambaEncoder + FPN + FCOS head)
+- **Pipeline A — Segmentation** (`abus_*.py`) — per-voxel tumour masks via SegMamba encoder-decoder
+- **Pipeline B — Detection FCOS** (`abus_det_*.py`) — 3D bounding boxes via MambaEncoder + FPN + FCOS head
+- **Pipeline C — Detection DETR** (`abus_detr_*.py`) — 3D bounding boxes via MambaEncoder + DETR transformer decoder
+- **Pipeline D — Multi-task BoxHead** (`abus_boxhead_*.py`) — segmentation + attention-based box regression from decoder features
 
 ---
 
@@ -309,4 +311,106 @@ python abus_det_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
 python abus_detr_train.py
 python abus_detr_predict.py --model_path ./logs/segmamba_abus_detr/model/best_model_XXXX.pt
 python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abus_detr/detections.json --abus_root /Volumes/Autzoko/ABUS
+```
+
+---
+
+# Pipeline D — Multi-task Detection (SegMamba-BoxHead)
+
+SegMamba-BoxHead extends the original SegMamba segmentation model with a
+lightweight attention-based Box Head that branches off the decoder's
+full-resolution feature map. The Box Head learns a spatial attention map over
+all voxels, aggregates features into a global vector, and regresses a single 3D
+bounding box via MLP — all while retaining the original segmentation
+supervision (Dice + CE).
+
+Architecture: `SegMamba encoder-decoder → decoder1 (B,48,128,128,128) → UnetOutBlock (seg) + BoxHead (det)`
+
+The BoxHead applies 3D convolutions for feature compression, predicts a
+single-channel attention weight map with softmax over the full voxel space,
+performs weighted aggregation, and regresses normalised box parameters through
+an MLP.
+
+## BoxHead Step 1 — Preprocessing
+
+Combines segmentation masks and detection boxes at 128^3 resolution.
+
+```bash
+python abus_boxhead_preprocessing.py --abus_root /Volumes/Autzoko/ABUS --output_base ./data/abus_boxhead
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--abus_root` | `/Volumes/Autzoko/ABUS` | Path to raw ABUS dataset |
+| `--output_base` | `./data/abus_boxhead` | Output directory |
+
+Output:
+```
+./data/abus_boxhead/{train,val,test}/ABUS_XXX.npz
+```
+
+Each NPZ contains: `data` (1,128,128,128), `seg` (1,128,128,128), `boxes` (N,6), `original_shape`, `spacing`.
+
+## BoxHead Step 2 — Training
+
+```bash
+python abus_boxhead_train.py --data_dir_train ./data/abus_boxhead/train --data_dir_val ./data/abus_boxhead/val
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--data_dir_train` | `./data/abus_boxhead/train` | Training data directory |
+| `--data_dir_val` | `./data/abus_boxhead/val` | Validation data directory |
+| `--logdir` | `./logs/segmamba_abus_boxhead` | Log and checkpoint directory |
+| `--max_epoch` | `500` | Total training epochs |
+| `--batch_size` | `2` | Per-GPU batch size |
+| `--val_every` | `5` | Validate every N epochs |
+| `--device` | `cuda:0` | GPU device |
+| `--lr` | `0.01` | Learning rate (SGD) |
+| `--det_weight` | `5.0` | Detection loss weight relative to seg loss |
+| `--num_workers` | `4` | Data loader workers |
+| `--pretrained_seg` | `""` | Path to SegMamba segmentation checkpoint |
+
+Loss: `total = (Dice + CE) + det_weight × (SmoothL1 + GIoU)`
+
+Monitor:
+```bash
+tensorboard --logdir ./logs/segmamba_abus_boxhead
+```
+
+## BoxHead Step 3 — Prediction
+
+```bash
+python abus_boxhead_predict.py --model_path ./logs/segmamba_abus_boxhead/model/best_model_XXXX.pt
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--model_path` | **(required)** | Path to trained checkpoint |
+| `--data_dir_test` | `./data/abus_boxhead/test` | Test data directory |
+| `--save_path` | `./prediction_results/segmamba_abus_boxhead` | Output directory |
+| `--save_seg` | (flag) | Also save segmentation masks as NIfTI |
+| `--device` | `cuda:0` | GPU device |
+
+Output: `./prediction_results/segmamba_abus_boxhead/detections.json`
+
+## BoxHead Step 4 — Evaluation
+
+**Same as Pipeline B/C.** Uses `abus_det_compute_metrics.py`.
+
+```bash
+python abus_det_compute_metrics.py \
+    --pred_file ./prediction_results/segmamba_abus_boxhead/detections.json \
+    --abus_root /Volumes/Autzoko/ABUS --split Test
+```
+
+Reports **AP@0.1**, **AP@0.25**, **AP@0.5**, recall, and mean best IoU.
+
+## BoxHead Quick-Start
+
+```bash
+python abus_boxhead_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
+python abus_boxhead_train.py
+python abus_boxhead_predict.py --model_path ./logs/segmamba_abus_boxhead/model/best_model_XXXX.pt
+python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abus_boxhead/detections.json --abus_root /Volumes/Autzoko/ABUS
 ```
