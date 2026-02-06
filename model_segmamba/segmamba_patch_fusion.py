@@ -341,9 +341,16 @@ def compute_giou_3d(box1, box2):
     Returns:
         giou: (...,) GIoU values in [-1, 1]
     """
+    # Ensure dimensions are positive (clamp to small positive value)
+    eps = 1e-6
+    box1_safe = box1.clone()
+    box2_safe = box2.clone()
+    box1_safe[..., 3:] = box1[..., 3:].clamp(min=eps)
+    box2_safe[..., 3:] = box2[..., 3:].clamp(min=eps)
+
     # Convert to corners
-    b1 = box_cxcyczdhwd_to_corners(box1)
-    b2 = box_cxcyczdhwd_to_corners(box2)
+    b1 = box_cxcyczdhwd_to_corners(box1_safe)
+    b2 = box_cxcyczdhwd_to_corners(box2_safe)
 
     # Intersection
     inter_z = torch.clamp(torch.min(b1[..., 3], b2[..., 3]) - torch.max(b1[..., 0], b2[..., 0]), min=0)
@@ -351,19 +358,23 @@ def compute_giou_3d(box1, box2):
     inter_x = torch.clamp(torch.min(b1[..., 5], b2[..., 5]) - torch.max(b1[..., 2], b2[..., 2]), min=0)
     inter = inter_z * inter_y * inter_x
 
-    # Volumes
-    vol1 = box1[..., 3] * box1[..., 4] * box1[..., 5]
-    vol2 = box2[..., 3] * box2[..., 4] * box2[..., 5]
+    # Volumes (guaranteed positive due to clamping above)
+    vol1 = box1_safe[..., 3] * box1_safe[..., 4] * box1_safe[..., 5]
+    vol2 = box2_safe[..., 3] * box2_safe[..., 4] * box2_safe[..., 5]
     union = vol1 + vol2 - inter
 
-    iou = inter / union.clamp(min=1e-6)
+    iou = inter / union.clamp(min=eps)
 
     # Enclosing box
     enc_z = torch.max(b1[..., 3], b2[..., 3]) - torch.min(b1[..., 0], b2[..., 0])
     enc_y = torch.max(b1[..., 4], b2[..., 4]) - torch.min(b1[..., 1], b2[..., 1])
     enc_x = torch.max(b1[..., 5], b2[..., 5]) - torch.min(b1[..., 2], b2[..., 2])
-    enc_vol = enc_z * enc_y * enc_x
+    enc_vol = (enc_z * enc_y * enc_x).clamp(min=eps)
 
-    giou = iou - (enc_vol - union) / enc_vol.clamp(min=1e-6)
+    giou = iou - (enc_vol - union) / enc_vol
+
+    # Clamp output to valid range and handle NaN
+    giou = torch.clamp(giou, min=-1.0, max=1.0)
+    giou = torch.nan_to_num(giou, nan=0.0)
 
     return giou

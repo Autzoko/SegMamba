@@ -452,12 +452,17 @@ def validate(model, loader, device):
             gt_dx = gt_box[5] - gt_box[2]
             gt_box_center = torch.stack([gt_cz, gt_cy, gt_cx, gt_dz, gt_dy, gt_dx])
 
-            giou = compute_giou_3d(fused_box, gt_box_center)
-            giou_list.append(giou.item())
+            # Check for valid boxes before computing GIoU
+            if gt_dz > 0 and gt_dy > 0 and gt_dx > 0:
+                giou = compute_giou_3d(fused_box, gt_box_center)
+                giou_val = giou.item()
 
-            # IoU
-            iou = (giou + 1) / 2  # Rough approximation: GIoU in [-1,1] -> IoU in [0,1]
-            iou_list.append(max(0, iou.item()))
+                # Skip NaN values
+                if not np.isnan(giou_val):
+                    giou_list.append(giou_val)
+                    # IoU approximation from GIoU
+                    iou = (giou_val + 1) / 2
+                    iou_list.append(max(0, min(1, iou)))
 
     return {
         'dice': np.mean(dice_list) if dice_list else 0.0,
