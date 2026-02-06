@@ -100,27 +100,45 @@ class ABUSPatchFusionDataset(Dataset):
         n = self.patches_per_volume
 
         if gt_box is not None:
-            # Sample some patches that overlap with GT box
+            # Sample patches that overlap with GT box
+            # For overlap: patch_start < box_end AND patch_start + patch_size > box_start
+            # So: box_start - patch_size < patch_start < box_end
             gz1, gy1, gx1, gz2, gy2, gx2 = gt_box
 
-            # At least half should overlap GT
-            n_overlap = max(1, n // 2)
-            for _ in range(n_overlap):
-                # Sample position that overlaps GT
-                z_min = max(0, int(gz2) - pd)
-                z_max = min(D - pd, int(gz1))
-                y_min = max(0, int(gy2) - ph)
-                y_max = min(H - ph, int(gy1))
-                x_min = max(0, int(gx2) - pw)
-                x_max = min(W - pw, int(gx1))
+            # Valid range for patch start to guarantee overlap with GT
+            z_min = max(0, int(gz1) - pd + 1)
+            z_max = min(D - pd, int(gz2) - 1)
+            y_min = max(0, int(gy1) - ph + 1)
+            y_max = min(H - ph, int(gy2) - 1)
+            x_min = max(0, int(gx1) - pw + 1)
+            x_max = min(W - pw, int(gx2) - 1)
 
-                z = np.random.randint(max(0, z_min), min(D - pd, z_max) + 1) if z_max >= z_min else max(0, min(D - pd, int((gz1 + gz2) / 2 - pd / 2)))
-                y = np.random.randint(max(0, y_min), min(H - ph, y_max) + 1) if y_max >= y_min else max(0, min(H - ph, int((gy1 + gy2) / 2 - ph / 2)))
-                x = np.random.randint(max(0, x_min), min(W - pw, x_max) + 1) if x_max >= x_min else max(0, min(W - pw, int((gx1 + gx2) / 2 - pw / 2)))
+            # Center position (fallback if range is invalid)
+            z_center = max(0, min(D - pd, int((gz1 + gz2) / 2 - pd / 2)))
+            y_center = max(0, min(H - ph, int((gy1 + gy2) / 2 - ph / 2)))
+            x_center = max(0, min(W - pw, int((gx1 + gx2) / 2 - pw / 2)))
+
+            # At least half should overlap GT (or all if n is small)
+            n_overlap = max(1, (n + 1) // 2)
+            for i in range(n_overlap):
+                if i == 0:
+                    # First patch always centered on tumor for best coverage
+                    z, y, x = z_center, y_center, x_center
+                elif z_max >= z_min and y_max >= y_min and x_max >= x_min:
+                    # Random position with guaranteed overlap
+                    z = np.random.randint(z_min, z_max + 1)
+                    y = np.random.randint(y_min, y_max + 1)
+                    x = np.random.randint(x_min, x_max + 1)
+                else:
+                    # Fallback to center with small jitter
+                    jitter = 10
+                    z = max(0, min(D - pd, z_center + np.random.randint(-jitter, jitter + 1)))
+                    y = max(0, min(H - ph, y_center + np.random.randint(-jitter, jitter + 1)))
+                    x = max(0, min(W - pw, x_center + np.random.randint(-jitter, jitter + 1)))
 
                 positions.append((z, y, x))
 
-        # Fill remaining with random positions
+        # Fill remaining with random positions (for context)
         while len(positions) < n:
             z = np.random.randint(0, max(1, D - pd + 1))
             y = np.random.randint(0, max(1, H - ph + 1))
@@ -304,7 +322,7 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
         'det_loss': det_loss,
         'obj_loss': obj_loss,
         'qual_loss': qual_loss,
-        'total': seg_loss + det_loss + 0.5 * obj_loss + 0.5 * qual_loss,
+        # Note: total loss is computed in training loop with warmup
     }, {
         'objectness_mean': objectness.mean().item(),
         'quality_mean': quality.mean().item(),
@@ -318,10 +336,24 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(model, loader, optimizer, device, scaler,
-                    dice_loss_fn, ce_loss_fn):
+                    dice_loss_fn, ce_loss_fn, epoch=0, warmup_epochs=50,
+                    det_weight=1.0, aux_weight=0.5):
+    """Train one epoch with detection loss warmup.
+
+    Args:
+        warmup_epochs: Number of epochs for detection warmup (0 = no warmup)
+        det_weight: Weight for detection loss after warmup
+        aux_weight: Weight for auxiliary losses (objectness, quality)
+    """
     model.train()
     total_losses = {'seg_loss': 0, 'det_loss': 0, 'obj_loss': 0, 'qual_loss': 0, 'total': 0}
     num_samples = 0
+
+    # Detection loss warmup: ramp up from 0 to det_weight over warmup_epochs
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        det_scale = epoch / warmup_epochs
+    else:
+        det_scale = 1.0
 
     for batch in tqdm(loader, desc="Training"):
         patches = batch['patches'].to(device)          # (N, 1, D, H, W)
@@ -341,6 +373,12 @@ def train_one_epoch(model, loader, optimizer, device, scaler,
                 seg_logits, boxes_local, objectness, quality,
                 seg_patches, positions, gt_box, has_gt_box, volume_shape,
                 dice_loss_fn, ce_loss_fn, device)
+
+            # Compute total loss with warmup
+            total_loss = losses['seg_loss']
+            total_loss = total_loss + det_scale * det_weight * losses['det_loss']
+            total_loss = total_loss + det_scale * aux_weight * (losses['obj_loss'] + losses['qual_loss'])
+            losses['total'] = total_loss
 
         scaler.scale(losses['total']).backward()
         scaler.unscale_(optimizer)
@@ -464,6 +502,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pretrained_seg", type=str, default="",
                         help="Path to pretrained SegMamba segmentation checkpoint")
+    parser.add_argument("--warmup_epochs", type=int, default=50,
+                        help="Epochs to warmup detection loss (0=no warmup)")
+    parser.add_argument("--det_weight", type=float, default=1.0,
+                        help="Detection loss weight after warmup")
+    parser.add_argument("--aux_weight", type=float, default=0.5,
+                        help="Auxiliary loss weight (objectness + quality)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -530,10 +574,14 @@ if __name__ == "__main__":
 
     best_metric = 0.0
 
+    print(f"Detection loss warmup: {args.warmup_epochs} epochs")
+
     for epoch in range(args.max_epoch):
         losses = train_one_epoch(
             model, train_loader, optimizer, device, scaler,
-            dice_loss_fn, ce_loss_fn)
+            dice_loss_fn, ce_loss_fn,
+            epoch=epoch, warmup_epochs=args.warmup_epochs,
+            det_weight=args.det_weight, aux_weight=args.aux_weight)
         scheduler.step(epoch)
 
         lr_now = optimizer.param_groups[0]['lr']
@@ -542,9 +590,11 @@ if __name__ == "__main__":
             writer.add_scalar(f"train/{k}", v, epoch)
         writer.add_scalar("train/lr", lr_now, epoch)
 
+        # Show warmup status
+        det_scale = min(1.0, epoch / args.warmup_epochs) if args.warmup_epochs > 0 else 1.0
         print(f"  [epoch {epoch:3d}]  total={losses['total']:.4f}  "
               f"seg={losses['seg_loss']:.4f}  det={losses['det_loss']:.4f}  "
-              f"lr={lr_now:.6f}")
+              f"det_scale={det_scale:.2f}  lr={lr_now:.6f}")
 
         if (epoch + 1) % args.val_every == 0:
             metrics = validate(model, val_loader, device)
