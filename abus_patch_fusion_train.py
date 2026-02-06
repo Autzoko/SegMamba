@@ -135,6 +135,8 @@ class ABUSPatchFusionDataset(Dataset):
 
         volume = data['data'].astype(np.float32)  # (1, D, H, W)
         seg = data['seg'].astype(np.int64)        # (1, D, H, W)
+        # Ensure binary segmentation (clamp to 0 or 1)
+        seg = np.clip(seg, 0, 1)
 
         if self.augment:
             volume, seg = self._augment(volume, seg)
@@ -219,10 +221,13 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
         metrics: dict with useful monitoring values
     """
     N = seg_logits.shape[0]
+    num_classes = seg_logits.shape[1]  # Should be 2
     patch_size = torch.tensor(PATCH_SIZE, device=device, dtype=torch.float32)
 
     # --- Segmentation loss (per-patch) ---
     seg_gt_flat = seg_gts[:, 0].long()  # (N, D, H, W)
+    # Clamp labels to valid range [0, num_classes-1] to prevent index out of bounds
+    seg_gt_flat = torch.clamp(seg_gt_flat, 0, num_classes - 1)
     dice_l = dice_loss_fn(seg_logits, seg_gt_flat.unsqueeze(1))
     ce_l = ce_loss_fn(seg_logits, seg_gt_flat)
     seg_loss = dice_l + ce_l
