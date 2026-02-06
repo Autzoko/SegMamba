@@ -282,8 +282,10 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
     det_loss = l1_loss + giou_loss
 
     # --- Auxiliary losses ---
-    # Objectness BCE
-    obj_loss = F.binary_cross_entropy(objectness, obj_targets)
+    # Objectness BCE (use logits version for AMP compatibility)
+    # Since objectness is already sigmoid, convert back to logits
+    objectness_logits = torch.log(objectness / (1 - objectness + 1e-7) + 1e-7)
+    obj_loss = F.binary_cross_entropy_with_logits(objectness_logits, obj_targets)
 
     # Quality loss (only for patches with GT overlap)
     has_overlap = obj_targets > 0.5
