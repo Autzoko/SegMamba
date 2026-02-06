@@ -30,10 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
-
-from monai.losses.dice import DiceLoss
 
 from model_segmamba.segmamba_patch_fusion import (
     SegMambaWithPatchFusion,
@@ -305,13 +302,18 @@ def compute_detection_losses(boxes_local, objectness, quality,
 # Training
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, optimizer, device, scaler):
-    """Train one epoch (BoxHead only, backbone frozen)."""
+def train_one_epoch(model, loader, optimizer, device):
+    """Train one epoch (BoxHead only, backbone frozen).
+
+    Note: AMP is disabled for Stage 2 because the BoxHead is small (~0.5M params)
+    and fp16 precision issues can cause NaN gradients.
+    """
     # Keep model in eval mode for frozen backbone, but BoxHead will still train
     model.eval()
 
     total_losses = {'det_loss': 0, 'obj_loss': 0, 'qual_loss': 0, 'total': 0}
     num_samples = 0
+    nan_batches = 0
 
     for batch in tqdm(loader, desc="Training"):
         patches = batch['patches'].to(device)
@@ -322,22 +324,25 @@ def train_one_epoch(model, loader, optimizer, device, scaler):
 
         optimizer.zero_grad()
 
-        with autocast():
-            # Forward pass using Stage 2 method - backbone no_grad, BoxHead with grad
-            seg_logits, boxes_local, objectness, quality = model.forward_boxhead_only(patches)
+        # Forward pass using Stage 2 method - backbone no_grad, BoxHead with grad
+        # No AMP to avoid fp16 precision issues
+        seg_logits, boxes_local, objectness, quality = model.forward_boxhead_only(patches)
 
-            losses, metrics = compute_detection_losses(
-                boxes_local, objectness, quality,
-                positions, gt_box, has_gt_box, volume_shape, device)
-
-        # Check for NaN
-        if torch.isnan(losses['total']) or torch.isinf(losses['total']):
-            print(f"  WARNING: NaN/Inf loss detected, skipping batch")
-            optimizer.zero_grad()
+        # Check for NaN in predictions
+        if torch.isnan(boxes_local).any() or torch.isnan(objectness).any() or torch.isnan(quality).any():
+            nan_batches += 1
             continue
 
-        scaler.scale(losses['total']).backward()
-        scaler.unscale_(optimizer)
+        losses, metrics = compute_detection_losses(
+            boxes_local, objectness, quality,
+            positions, gt_box, has_gt_box, volume_shape, device)
+
+        # Check for NaN in loss
+        if torch.isnan(losses['total']) or torch.isinf(losses['total']):
+            nan_batches += 1
+            continue
+
+        losses['total'].backward()
 
         # Check for NaN gradients
         has_nan_grad = False
@@ -347,18 +352,20 @@ def train_one_epoch(model, loader, optimizer, device, scaler):
                 break
 
         if has_nan_grad:
-            print(f"  WARNING: NaN gradient detected, skipping batch")
+            nan_batches += 1
             optimizer.zero_grad()
-            scaler.update()
             continue
 
+        # Gradient clipping
         nn.utils.clip_grad_norm_(model.patch_box_head.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
         for k in total_losses:
             total_losses[k] += losses[k].item()
         num_samples += 1
+
+    if nan_batches > 0:
+        print(f"  Skipped {nan_batches} batches due to NaN")
 
     return {k: v / max(num_samples, 1) for k, v in total_losses.items()}
 
@@ -518,16 +525,16 @@ if __name__ == "__main__":
         lr=args.lr,
         weight_decay=1e-4)
     scheduler = PolyLRScheduler(optimizer, args.max_epoch)
-    scaler = GradScaler()
 
     best_metric = -1.0
 
     print(f"\n{'='*60}")
     print(f"  Stage 2: Training BoxHead on frozen SegMamba features")
+    print(f"  (AMP disabled for numerical stability)")
     print(f"{'='*60}\n")
 
     for epoch in range(args.max_epoch):
-        losses = train_one_epoch(model, train_loader, optimizer, device, scaler)
+        losses = train_one_epoch(model, train_loader, optimizer, device)
         scheduler.step(epoch)
 
         lr_now = optimizer.param_groups[0]['lr']
