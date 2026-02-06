@@ -307,20 +307,8 @@ def compute_detection_losses(boxes_local, objectness, quality,
 
 def train_one_epoch(model, loader, optimizer, device, scaler):
     """Train one epoch (BoxHead only, backbone frozen)."""
-    model.train()
-    # Keep backbone in eval mode to ensure BatchNorm/Dropout behave correctly
-    model.vit.eval()
-    model.encoder1.eval()
-    model.encoder2.eval()
-    model.encoder3.eval()
-    model.encoder4.eval()
-    model.encoder5.eval()
-    model.decoder5.eval()
-    model.decoder4.eval()
-    model.decoder3.eval()
-    model.decoder2.eval()
-    model.decoder1.eval()
-    model.out.eval()
+    # Keep model in eval mode for frozen backbone, but BoxHead will still train
+    model.eval()
 
     total_losses = {'det_loss': 0, 'obj_loss': 0, 'qual_loss': 0, 'total': 0}
     num_samples = 0
@@ -335,8 +323,8 @@ def train_one_epoch(model, loader, optimizer, device, scaler):
         optimizer.zero_grad()
 
         with autocast():
-            # Forward pass - only BoxHead gradients flow
-            seg_logits, boxes_local, objectness, quality = model(patches)
+            # Forward pass using Stage 2 method - backbone no_grad, BoxHead with grad
+            seg_logits, boxes_local, objectness, quality = model.forward_boxhead_only(patches)
 
             losses, metrics = compute_detection_losses(
                 boxes_local, objectness, quality,

@@ -155,6 +155,47 @@ class SegMambaWithPatchFusion(SegMamba):
 
         return seg_logits, box, objectness, quality
 
+    def forward_boxhead_only(self, x_in):
+        """Forward pass for Stage 2 training with frozen backbone.
+
+        Uses torch.no_grad() for backbone to prevent gradient issues,
+        then enables gradients only for BoxHead.
+
+        Args:
+            x_in: (B, 1, D, H, W) input volume patch
+
+        Returns:
+            seg_logits: (B, out_chans, D, H, W) segmentation logits (no grad)
+            box: (B, 6) local box prediction (with grad)
+            objectness: (B, 1) objectness score (with grad)
+            quality: (B, 1) quality score (with grad)
+        """
+        # Run backbone without gradients
+        with torch.no_grad():
+            outs = self.vit(x_in)
+            enc1 = self.encoder1(x_in)
+            x2 = outs[0]
+            enc2 = self.encoder2(x2)
+            x3 = outs[1]
+            enc3 = self.encoder3(x3)
+            x4 = outs[2]
+            enc4 = self.encoder4(x4)
+            enc_hidden = self.encoder5(outs[3])
+
+            dec3 = self.decoder5(enc_hidden, enc4)
+            dec2 = self.decoder4(dec3, enc3)
+            dec1 = self.decoder3(dec2, enc2)
+            dec0 = self.decoder2(dec1, enc1)
+            out = self.decoder1(dec0)  # (B, 48, D, H, W)
+
+            seg_logits = self.out(out)  # (B, out_chans, D, H, W)
+
+        # BoxHead with gradients - clone to create new tensor with grad enabled
+        out_for_boxhead = out.clone().detach().requires_grad_(True)
+        box, objectness, quality = self.patch_box_head(out_for_boxhead)
+
+        return seg_logits, box, objectness, quality
+
 
 # ---------------------------------------------------------------------------
 # Fusion utilities
