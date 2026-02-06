@@ -1,12 +1,13 @@
 # SegMamba for ABUS 3D Ultrasound
 
-Five pipelines for the ABUS (Automated Breast Ultrasound) dataset:
+Six pipelines for the ABUS (Automated Breast Ultrasound) dataset:
 
 - **Pipeline A — Segmentation** (`abus_*.py`) — per-voxel tumour masks via SegMamba encoder-decoder
 - **Pipeline B — Detection FCOS** (`abus_det_*.py`) — 3D bounding boxes via MambaEncoder + FPN + FCOS head
 - **Pipeline C — Detection DETR** (`abus_detr_*.py`) — 3D bounding boxes via MambaEncoder + DETR transformer decoder
 - **Pipeline D — Multi-task BoxHead** (`abus_boxhead_*.py`) — segmentation + attention-based box regression from decoder features
-- **Pipeline E — Patch-Set Global Fusion** (`abus_patch_fusion_*.py`) — multi-task with differentiable patch-to-global box fusion (recommended)
+- **Pipeline E — Patch-Set Global Fusion** (`abus_patch_fusion_*.py`) — multi-task with differentiable patch-to-global box fusion
+- **Pipeline F — Two-Stage Training** (`abus_stage2_boxhead_*.py`) — **recommended**: train segmentation first, then BoxHead on frozen features
 
 ---
 
@@ -600,19 +601,161 @@ boxes without any changes to the original SegMamba training pipeline.
 
 ---
 
-## Alternative: Two-Stage BoxHead Training
+---
 
-For learned box regression (rather than mask-derived boxes), use two-stage training:
+# Pipeline F — Two-Stage Training (Recommended)
+
+Two-stage training separates segmentation and detection training for **stable and
+high-quality results**. This avoids the training instability seen with joint multi-task
+optimization.
+
+## Motivation
+
+Joint training of segmentation and detection (Pipeline E) can be unstable due to:
+- Conflicting gradient signals from different loss functions
+- Detection loss interfering with segmentation convergence early in training
+- Numerical instability from auxiliary losses under AMP
+
+The two-stage approach:
+1. **Stage 1**: Train SegMamba purely for segmentation until stable, high-quality masks
+2. **Stage 2**: Freeze SegMamba, train only a lightweight BoxHead for detection
+
+## Architecture (Stage 2)
+
+```
+Input Patch (B, 1, 128, 128, 128)
+    │
+    ▼
+Frozen SegMamba Encoder-Decoder
+    │
+    ├─→ decoder1 (B, 48, 128, 128, 128) ─→ [frozen] UnetOutBlock → Seg logits
+    │
+    └─→ [trainable] PatchBoxHead:
+          Conv3d(48→64, s=1) + IN + ReLU
+          Conv3d(64→64, s=2) + IN + ReLU
+          Conv3d(64→64, s=2) + IN + ReLU
+          Global Avg Pool → (B, 64)
+          ├─→ MLP → box (B, 6)
+          ├─→ MLP → objectness (B, 1)
+          └─→ MLP → quality (B, 1)
+    │
+    ▼
+Global Fusion (same as Pipeline E):
+    fused_box = soft_weighted_average(boxes_global, objectness × quality)
+    │
+    ▼
+Detection Losses only:
+    det_loss = SmoothL1 + GIoU
+    obj_loss = BCE
+    qual_loss = MSE
+```
+
+**Benefits:**
+- Segmentation performance is preserved (frozen weights)
+- BoxHead learns to read geometric structure from stable features
+- More stable training, no multi-task loss balancing needed
+- Faster Stage 2 training (~0.5M trainable params vs ~75M total)
+- Provides clean foundation for using boxes as prompts in downstream tasks
+
+## Stage 1 — Segmentation Training
+
+Use the standard Pipeline A training:
 
 ```bash
-# Stage 1: Train segmentation at full resolution
+# Preprocessing
+python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS --output_base ./data/abus
+
+# Training (train until Dice > 0.7)
+python abus_train.py --data_dir_train ./data/abus/train \
+                     --data_dir_val ./data/abus/val \
+                     --max_epoch 1000
+
+# Verify segmentation quality
+python abus_predict.py --model_path ./logs/segmamba_abus/model/best_model_XXXX.pt
+python abus_compute_metrics.py --pred_name segmamba_abus
+```
+
+## Stage 2 — BoxHead Training
+
+Train only the BoxHead with frozen SegMamba:
+
+```bash
+python abus_stage2_boxhead_train.py \
+    --pretrained_seg ./logs/segmamba_abus/model/best_model_XXXX.pt \
+    --data_dir_train ./data/abus/train \
+    --data_dir_val ./data/abus/val
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--pretrained_seg` | **(required)** | Path to Stage 1 SegMamba checkpoint |
+| `--data_dir_train` | `./data/abus/train` | Training data directory |
+| `--data_dir_val` | `./data/abus/val` | Validation data directory |
+| `--logdir` | `./logs/segmamba_abus_stage2_boxhead` | Log directory |
+| `--max_epoch` | `200` | Training epochs (fewer needed) |
+| `--patches_per_volume` | `4` | Patches sampled per volume |
+| `--val_every` | `5` | Validate every N epochs |
+| `--device` | `cuda:0` | GPU device |
+| `--lr` | `0.001` | Learning rate (lower than Stage 1) |
+
+Monitor:
+```bash
+tensorboard --logdir ./logs/segmamba_abus_stage2_boxhead
+```
+
+## Stage 2 — Prediction
+
+```bash
+python abus_stage2_boxhead_predict.py \
+    --pretrained_seg ./logs/segmamba_abus/model/best_model_XXXX.pt \
+    --boxhead_path ./logs/segmamba_abus_stage2_boxhead/model/best_model_giouX.XXXX.pt \
+    --save_seg
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--pretrained_seg` | **(required)** | Path to Stage 1 SegMamba checkpoint |
+| `--boxhead_path` | **(required)** | Path to Stage 2 BoxHead checkpoint |
+| `--data_dir_test` | `./data/abus/test` | Test data directory |
+| `--save_path` | `./prediction_results/segmamba_abus_stage2_boxhead` | Output directory |
+| `--save_seg` | (flag) | Save segmentation masks as NIfTI |
+| `--overlap` | `0.5` | Sliding window overlap |
+
+Outputs:
+- `detections.json`: Detection boxes
+- `*.nii.gz`: Segmentation masks (if `--save_seg`)
+
+## Stage 2 — Evaluation
+
+```bash
+# Segmentation (if --save_seg was used)
+python abus_compute_metrics.py --pred_name segmamba_abus_stage2_boxhead
+
+# Detection
+python abus_det_compute_metrics.py \
+    --pred_file ./prediction_results/segmamba_abus_stage2_boxhead/detections.json \
+    --abus_root /Volumes/Autzoko/ABUS --split Test
+```
+
+## Two-Stage Quick-Start
+
+```bash
+# Stage 1: Segmentation
 python abus_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
 python abus_train.py --max_epoch 1000
+python abus_compute_metrics.py  # Verify Dice > 0.7
 
-# Stage 2: Fine-tune BoxHead with frozen backbone (uses 128³ resized data)
-python abus_boxhead_preprocessing.py --abus_root /Volumes/Autzoko/ABUS
-python abus_boxhead_train.py \
+# Stage 2: Detection
+python abus_stage2_boxhead_train.py \
+    --pretrained_seg ./logs/segmamba_abus/model/best_model_XXXX.pt
+
+# Predict & Evaluate
+python abus_stage2_boxhead_predict.py \
     --pretrained_seg ./logs/segmamba_abus/model/best_model_XXXX.pt \
-    --freeze_backbone \
-    --max_epoch 200
+    --boxhead_path ./logs/segmamba_abus_stage2_boxhead/model/best_model_giouX.XXXX.pt \
+    --save_seg
+python abus_compute_metrics.py --pred_name segmamba_abus_stage2_boxhead
+python abus_det_compute_metrics.py \
+    --pred_file ./prediction_results/segmamba_abus_stage2_boxhead/detections.json \
+    --abus_root /Volumes/Autzoko/ABUS
 ```
