@@ -117,11 +117,11 @@ class SegMambaWithPatchFusion(SegMamba):
         # Add patch box head branching from decoder1 output
         self.patch_box_head = PatchBoxHead(in_channels=feat_size[0])
 
-    def forward(self, x):
+    def forward(self, x_in):
         """Forward pass returning both segmentation and detection outputs.
 
         Args:
-            x: (B, 1, D, H, W) input volume patch
+            x_in: (B, 1, D, H, W) input volume patch
 
         Returns:
             seg_logits: (B, out_chans, D, H, W) segmentation logits
@@ -129,25 +129,29 @@ class SegMambaWithPatchFusion(SegMamba):
             objectness: (B, 1) objectness score
             quality: (B, 1) quality score
         """
-        # Encoder (same as parent)
-        outs = self.vit(x)
+        # Encoder (same as parent SegMamba)
+        outs = self.vit(x_in)
+        enc1 = self.encoder1(x_in)
+        x2 = outs[0]
+        enc2 = self.encoder2(x2)
+        x3 = outs[1]
+        enc3 = self.encoder3(x3)
+        x4 = outs[2]
+        enc4 = self.encoder4(x4)
+        enc_hidden = self.encoder5(outs[3])
 
-        # Decoder (same as parent, but we tap decoder1 features)
-        enc1 = self.encoder1(x)
-        x2 = self.encoder2(outs[0])
-        x3 = self.encoder3(outs[1])
-        x4 = self.encoder4(outs[2])
-
-        dec4 = self.decoder5(outs[3], x4)
-        dec3 = self.decoder4(dec4, x3)
-        dec2 = self.decoder3(dec3, x2)
-        dec1 = self.decoder2(dec2, enc1)  # (B, 48, D, H, W)
+        # Decoder (same as parent SegMamba)
+        dec3 = self.decoder5(enc_hidden, enc4)
+        dec2 = self.decoder4(dec3, enc3)
+        dec1 = self.decoder3(dec2, enc2)
+        dec0 = self.decoder2(dec1, enc1)
+        out = self.decoder1(dec0)  # (B, 48, D, H, W)
 
         # Segmentation head
-        seg_logits = self.decoder1(dec1)  # (B, out_chans, D, H, W)
+        seg_logits = self.out(out)  # (B, out_chans, D, H, W)
 
-        # Detection head (operates on decoder1 features)
-        box, objectness, quality = self.patch_box_head(dec1)
+        # Detection head (operates on decoder1 output features)
+        box, objectness, quality = self.patch_box_head(out)
 
         return seg_logits, box, objectness, quality
 
