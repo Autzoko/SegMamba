@@ -244,8 +244,8 @@ def fuse_patch_boxes(boxes_global, objectness, quality, eps=1e-6):
     fused_box = (weights_norm.unsqueeze(-1) * boxes_global).sum(dim=0)  # (6,)
 
     # Ensure dimensions are positive (clamp to minimum 1.0 voxel)
-    fused_box = fused_box.clone()
-    fused_box[3:] = fused_box[3:].clamp(min=1.0)
+    # Use torch.cat to avoid in-place operation that breaks autograd
+    fused_box = torch.cat([fused_box[:3], fused_box[3:].clamp(min=1.0)], dim=0)
 
     return fused_box, weights_norm
 
