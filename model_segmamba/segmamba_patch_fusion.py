@@ -228,6 +228,11 @@ def fuse_patch_boxes(boxes_global, objectness, quality, eps=1e-6):
         fused_box: (6,) weighted average box
         weights: (N,) normalized fusion weights
     """
+    # Ensure float32 for numerical stability
+    boxes_global = boxes_global.float()
+    objectness = objectness.float()
+    quality = quality.float()
+
     # Compute fusion weights
     weights = (objectness * quality).squeeze(-1)  # (N,)
 
@@ -237,6 +242,10 @@ def fuse_patch_boxes(boxes_global, objectness, quality, eps=1e-6):
 
     # Weighted average of boxes
     fused_box = (weights_norm.unsqueeze(-1) * boxes_global).sum(dim=0)  # (6,)
+
+    # Ensure dimensions are positive (clamp to minimum 1.0 voxel)
+    fused_box = fused_box.clone()
+    fused_box[3:] = fused_box[3:].clamp(min=1.0)
 
     return fused_box, weights_norm
 

@@ -28,11 +28,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import GradScaler, autocast
-from scipy import ndimage
 from tqdm import tqdm
 
 from monai.losses.dice import DiceLoss
-from monai.inferers import SlidingWindowInferer
 
 from model_segmamba.segmamba_patch_fusion import (
     SegMambaWithPatchFusion,
@@ -240,14 +238,15 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
     """
     N = seg_logits.shape[0]
     num_classes = seg_logits.shape[1]  # Should be 2
-    patch_size = torch.tensor(PATCH_SIZE, device=device, dtype=torch.float32)
 
     # --- Segmentation loss (per-patch) ---
     seg_gt_flat = seg_gts[:, 0].long()  # (N, D, H, W)
     # Clamp labels to valid range [0, num_classes-1] to prevent index out of bounds
     seg_gt_flat = torch.clamp(seg_gt_flat, 0, num_classes - 1)
-    dice_l = dice_loss_fn(seg_logits, seg_gt_flat.unsqueeze(1))
-    ce_l = ce_loss_fn(seg_logits, seg_gt_flat)
+    # Use float32 for loss computation to avoid numerical issues with AMP
+    seg_logits_f32 = seg_logits.float()
+    dice_l = dice_loss_fn(seg_logits_f32, seg_gt_flat.unsqueeze(1))
+    ce_l = ce_loss_fn(seg_logits_f32, seg_gt_flat)
     seg_loss = dice_l + ce_l
 
     if not has_gt_box:
@@ -268,7 +267,7 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
         boxes_local, positions, PATCH_SIZE, volume_shape.tolist())
 
     # --- Fuse patch boxes ---
-    fused_box, weights = fuse_patch_boxes(boxes_global, objectness, quality)
+    fused_box, _ = fuse_patch_boxes(boxes_global, objectness, quality)
 
     # --- Compute per-patch targets for auxiliary losses ---
     gt_box_np = gt_box.cpu().numpy()
@@ -295,25 +294,33 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
     gt_dx = gt_box[5] - gt_box[2]
     gt_box_center = torch.stack([gt_cz, gt_cy, gt_cx, gt_dz, gt_dy, gt_dx])
 
+    # Use float32 for stability
+    fused_box_f32 = fused_box.float()
+    gt_box_center_f32 = gt_box_center.float()
+
     # L1 loss
-    l1_loss = F.smooth_l1_loss(fused_box, gt_box_center)
+    l1_loss = F.smooth_l1_loss(fused_box_f32, gt_box_center_f32)
 
     # GIoU loss
-    giou = compute_giou_3d(fused_box, gt_box_center)
+    giou = compute_giou_3d(fused_box_f32, gt_box_center_f32)
     giou_loss = 1 - giou
 
-    det_loss = l1_loss + giou_loss
+    # Clamp detection loss to avoid extreme values
+    det_loss = (l1_loss + giou_loss).clamp(max=10.0)
 
     # --- Auxiliary losses ---
     # Objectness BCE (use logits version for AMP compatibility)
-    # Since objectness is already sigmoid, convert back to logits
-    objectness_logits = torch.log(objectness / (1 - objectness + 1e-7) + 1e-7)
-    obj_loss = F.binary_cross_entropy_with_logits(objectness_logits, obj_targets)
+    # Since objectness is already sigmoid, convert back to logits with numerical stability
+    # Clamp to avoid extreme values that cause NaN under float16
+    objectness_clamped = objectness.float().clamp(1e-4, 1 - 1e-4)
+    objectness_logits = torch.log(objectness_clamped / (1 - objectness_clamped))
+    obj_loss = F.binary_cross_entropy_with_logits(objectness_logits, obj_targets.float())
 
     # Quality loss (only for patches with GT overlap)
     has_overlap = obj_targets > 0.5
     if has_overlap.any():
-        qual_loss = F.mse_loss(quality[has_overlap], qual_targets[has_overlap])
+        # Use float32 for numerical stability
+        qual_loss = F.mse_loss(quality[has_overlap].float(), qual_targets[has_overlap].float())
     else:
         qual_loss = torch.tensor(0.0, device=device)
 
@@ -380,8 +387,30 @@ def train_one_epoch(model, loader, optimizer, device, scaler,
             total_loss = total_loss + det_scale * aux_weight * (losses['obj_loss'] + losses['qual_loss'])
             losses['total'] = total_loss
 
+        # Check for NaN before backward to avoid corrupting model
+        if torch.isnan(losses['total']) or torch.isinf(losses['total']):
+            print(f"  WARNING: NaN/Inf loss detected, skipping batch. "
+                  f"seg={losses['seg_loss'].item() if not torch.isnan(losses['seg_loss']) else 'nan'}, "
+                  f"det={losses['det_loss'].item() if not torch.isnan(losses['det_loss']) else 'nan'}, "
+                  f"obj={losses['obj_loss'].item() if not torch.isnan(losses['obj_loss']) else 'nan'}")
+            optimizer.zero_grad()
+            continue
+
         scaler.scale(losses['total']).backward()
         scaler.unscale_(optimizer)
+
+        # Check for NaN gradients
+        has_nan_grad = False
+        for p in model.parameters():
+            if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                has_nan_grad = True
+                break
+
+        if has_nan_grad:
+            print(f"  WARNING: NaN/Inf gradient detected, skipping batch")
+            optimizer.zero_grad()
+            continue
+
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
@@ -405,9 +434,6 @@ def validate(model, loader, device):
     dice_list = []
     giou_list = []
     iou_list = []
-
-    window_inferer = SlidingWindowInferer(
-        roi_size=PATCH_SIZE, sw_batch_size=4, overlap=0.5, mode="gaussian")
 
     for batch in tqdm(loader, desc="Validating"):
         patches = batch['patches'].to(device)
