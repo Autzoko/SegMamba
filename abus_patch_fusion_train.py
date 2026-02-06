@@ -409,6 +409,7 @@ def train_one_epoch(model, loader, optimizer, device, scaler,
         if has_nan_grad:
             print(f"  WARNING: NaN/Inf gradient detected, skipping batch")
             optimizer.zero_grad()
+            scaler.update()  # Must call update() after unscale_() before next iteration
             continue
 
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
