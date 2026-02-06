@@ -139,9 +139,12 @@ def predict_volume(model, volume, device, overlap=0.5, batch_size=4):
             patches.append(patch)
 
         patches = torch.from_numpy(np.stack(patches)).to(device)
+        batch_pos = torch.tensor(batch_positions, dtype=torch.float32, device=device)
+        vol_shape = torch.tensor(volume_shape, dtype=torch.float32, device=device)
 
         with autocast():
-            seg_logits, boxes_local, objectness, quality = model(patches)
+            seg_logits, boxes_local, objectness, quality = model(
+                patches, patch_pos=batch_pos, volume_shape=vol_shape)
 
         # Softmax for segmentation
         seg_probs = torch.softmax(seg_logits, dim=1).cpu().numpy()

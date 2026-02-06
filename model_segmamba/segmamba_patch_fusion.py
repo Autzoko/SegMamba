@@ -28,6 +28,16 @@ class PatchBoxHead(nn.Module):
       - box: (B, 6) normalized [cz, cy, cx, dz, dy, dx] in local patch coords
       - objectness: (B, 1) probability that patch contains (part of) target
       - quality: (B, 1) prediction reliability score
+
+    Coordinate Convention:
+      - Center (cz, cy, cx): Normalized to patch size. 0.5 = patch center.
+        Range [-0.5, 1.5] allows predicting boxes extending beyond patch.
+      - Dimensions (dz, dy, dx): Normalized to patch size. 1.0 = full patch size (128).
+        Range (0, 2] ensures positive dimensions, max 2x patch size.
+
+    Positional Encoding:
+      - Patch position in global volume is injected as additional features
+      - Helps network understand global context from local patch view
     """
 
     def __init__(self, in_channels=48, hidden_dim=64):
@@ -44,35 +54,47 @@ class PatchBoxHead(nn.Module):
         # Global pooling will give us (B, hidden_dim) features
         # After 2 stride-2 convs on 128³: 128 -> 64 -> 32
 
-        # Prediction heads
+        # Position encoding: 6 values (patch_start normalized + patch_end normalized)
+        self.pos_embed = nn.Sequential(
+            nn.Linear(6, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, hidden_dim),
+        )
+
+        # Prediction heads - input is hidden_dim * 2 (features + position)
         self.box_head = nn.Sequential(
-            nn.Linear(hidden_dim, 128),
+            nn.Linear(hidden_dim * 2, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, 6),
         )
 
         self.objectness_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
+            nn.Linear(hidden_dim * 2, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 1),
         )
 
         self.quality_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
+            nn.Linear(hidden_dim * 2, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 1),
         )
 
-    def forward(self, feat):
+    def forward(self, feat, patch_pos=None, volume_shape=None):
         """
         Args:
             feat: (B, C, D, H, W) decoder features, typically (B, 48, 128, 128, 128)
+            patch_pos: (B, 3) or None, patch start position [z, y, x] in voxels
+            volume_shape: (3,) or None, full volume shape [D, H, W] for normalization
 
         Returns:
             box: (B, 6) normalized box params [cz, cy, cx, dz, dy, dx]
             objectness: (B, 1) sigmoid probability
             quality: (B, 1) sigmoid probability
         """
+        B = feat.shape[0]
+        patch_size = feat.shape[2:]  # (D, H, W) = (128, 128, 128)
+
         x = F.relu(self.norm1(self.conv1(feat)))
         x = F.relu(self.norm2(self.conv2(x)))
         x = F.relu(self.norm3(self.conv3(x)))
@@ -80,11 +102,39 @@ class PatchBoxHead(nn.Module):
         # Global average pooling
         x = x.mean(dim=[2, 3, 4])  # (B, hidden_dim)
 
+        # Position encoding
+        if patch_pos is not None and volume_shape is not None:
+            # Normalize positions to [0, 1] based on volume shape
+            volume_shape = torch.as_tensor(volume_shape, dtype=feat.dtype, device=feat.device)
+            patch_size_t = torch.tensor(patch_size, dtype=feat.dtype, device=feat.device)
+
+            # Compute normalized start and end positions
+            pos_start = patch_pos / volume_shape  # (B, 3) in [0, 1]
+            pos_end = (patch_pos + patch_size_t) / volume_shape  # (B, 3)
+            pos_end = pos_end.clamp(max=1.0)  # Clamp for edge patches
+
+            pos_info = torch.cat([pos_start, pos_end], dim=1)  # (B, 6)
+            pos_feat = self.pos_embed(pos_info)  # (B, hidden_dim)
+        else:
+            # No position info - use zeros (for backward compatibility)
+            pos_feat = torch.zeros(B, x.shape[1], device=x.device, dtype=x.dtype)
+
+        # Concatenate features and position encoding
+        x = torch.cat([x, pos_feat], dim=1)  # (B, hidden_dim * 2)
+
         # Predictions
-        box = self.box_head(x)  # (B, 6)
-        # Box uses sigmoid to keep in reasonable range, but can go outside [0,1]
-        # for predictions beyond patch boundaries
-        box = torch.sigmoid(box) * 2 - 0.5  # Range [-0.5, 1.5]
+        box_raw = self.box_head(x)  # (B, 6)
+
+        # Apply constraints to box parameters
+        # Center (first 3): sigmoid * 2 - 0.5 → range [-0.5, 1.5]
+        #   Allows predicting centers outside patch for partially visible targets
+        center = torch.sigmoid(box_raw[:, :3]) * 2 - 0.5
+
+        # Dimensions (last 3): sigmoid * 2 + eps → range (0, 2]
+        #   Must be positive, max 2x patch size (256 voxels)
+        dims = torch.sigmoid(box_raw[:, 3:]) * 2 + 0.01  # eps=0.01 ensures positive
+
+        box = torch.cat([center, dims], dim=1)  # (B, 6)
 
         objectness = torch.sigmoid(self.objectness_head(x))  # (B, 1)
         quality = torch.sigmoid(self.quality_head(x))        # (B, 1)
@@ -117,11 +167,13 @@ class SegMambaWithPatchFusion(SegMamba):
         # Add patch box head branching from decoder1 output
         self.patch_box_head = PatchBoxHead(in_channels=feat_size[0])
 
-    def forward(self, x_in):
+    def forward(self, x_in, patch_pos=None, volume_shape=None):
         """Forward pass returning both segmentation and detection outputs.
 
         Args:
             x_in: (B, 1, D, H, W) input volume patch
+            patch_pos: (B, 3) or None, patch start positions for positional encoding
+            volume_shape: (3,) or None, full volume shape for normalization
 
         Returns:
             seg_logits: (B, out_chans, D, H, W) segmentation logits
@@ -151,11 +203,11 @@ class SegMambaWithPatchFusion(SegMamba):
         seg_logits = self.out(out)  # (B, out_chans, D, H, W)
 
         # Detection head (operates on decoder1 output features)
-        box, objectness, quality = self.patch_box_head(out)
+        box, objectness, quality = self.patch_box_head(out, patch_pos, volume_shape)
 
         return seg_logits, box, objectness, quality
 
-    def forward_boxhead_only(self, x_in):
+    def forward_boxhead_only(self, x_in, patch_pos=None, volume_shape=None):
         """Forward pass for Stage 2 training with frozen backbone.
 
         Uses torch.no_grad() for backbone to prevent gradient issues,
@@ -163,6 +215,8 @@ class SegMambaWithPatchFusion(SegMamba):
 
         Args:
             x_in: (B, 1, D, H, W) input volume patch
+            patch_pos: (B, 3) or None, patch start positions for positional encoding
+            volume_shape: (3,) or None, full volume shape for normalization
 
         Returns:
             seg_logits: (B, out_chans, D, H, W) segmentation logits (no grad)
@@ -192,7 +246,7 @@ class SegMambaWithPatchFusion(SegMamba):
 
         # BoxHead with gradients - clone to create new tensor with grad enabled
         out_for_boxhead = out.clone().detach().requires_grad_(True)
-        box, objectness, quality = self.patch_box_head(out_for_boxhead)
+        box, objectness, quality = self.patch_box_head(out_for_boxhead, patch_pos, volume_shape)
 
         return seg_logits, box, objectness, quality
 

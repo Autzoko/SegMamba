@@ -373,8 +373,9 @@ def train_one_epoch(model, loader, optimizer, device, scaler,
         optimizer.zero_grad()
 
         with autocast():
-            # Forward all patches at once
-            seg_logits, boxes_local, objectness, quality = model(patches)
+            # Forward all patches at once with positional encoding
+            seg_logits, boxes_local, objectness, quality = model(
+                patches, patch_pos=positions, volume_shape=volume_shape)
 
             losses, _ = compute_losses(
                 seg_logits, boxes_local, objectness, quality,
@@ -444,8 +445,9 @@ def validate(model, loader, device):
         has_gt_box = batch['has_gt_box']
         volume_shape = batch['volume_shape'].to(device)
 
-        # Forward all patches
-        seg_logits, boxes_local, objectness, quality = model(patches)
+        # Forward all patches with positional encoding
+        seg_logits, boxes_local, objectness, quality = model(
+            patches, patch_pos=positions, volume_shape=volume_shape)
 
         # Segmentation Dice (average over patches)
         seg_pred = seg_logits.argmax(dim=1)  # (N, D, H, W)

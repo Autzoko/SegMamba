@@ -326,7 +326,9 @@ def train_one_epoch(model, loader, optimizer, device):
 
         # Forward pass using Stage 2 method - backbone no_grad, BoxHead with grad
         # No AMP to avoid fp16 precision issues
-        seg_logits, boxes_local, objectness, quality = model.forward_boxhead_only(patches)
+        # Pass patch positions and volume shape for positional encoding
+        seg_logits, boxes_local, objectness, quality = model.forward_boxhead_only(
+            patches, patch_pos=positions, volume_shape=volume_shape)
 
         # Check for NaN in predictions
         if torch.isnan(boxes_local).any() or torch.isnan(objectness).any() or torch.isnan(quality).any():
@@ -392,7 +394,9 @@ def validate(model, loader, device):
         if not has_gt_box:
             continue
 
-        seg_logits, boxes_local, objectness, quality = model(patches)
+        # Use forward_boxhead_only for consistency with training
+        seg_logits, boxes_local, objectness, quality = model.forward_boxhead_only(
+            patches, patch_pos=positions, volume_shape=volume_shape)
 
         boxes_global = transform_box_to_global(
             boxes_local, positions, PATCH_SIZE, volume_shape.tolist())
