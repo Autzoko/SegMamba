@@ -226,7 +226,11 @@ class ABUSRetinaDataset(Dataset):
         npz_path = self.files[idx]
         data = np.load(npz_path)
         volume = data['data'].astype(np.float32)  # (1, D, H, W)
-        mask = data['seg'].astype(np.float32)  # (D, H, W)
+        mask = data['seg'].astype(np.float32)  # (1, D, H, W) or (D, H, W)
+
+        # Handle both (1, D, H, W) and (D, H, W) formats
+        if mask.ndim == 4:
+            mask = mask[0]  # (D, H, W)
 
         volume_shape = mask.shape
 
