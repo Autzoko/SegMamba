@@ -273,7 +273,82 @@ def _sliding_window_positions(volume_shape, patch_size, overlap=0.5):
     return positions
 
 
-def evaluate_detections(pred_dir, abus_root, split="Test", min_volume=100):
+def build_gt_box_cache(abus_root, split="Test", cache_path=None):
+    """Build or load cached GT boxes to avoid repeated NRRD reads.
+
+    Parameters
+    ----------
+    abus_root : str
+        Root directory of ABUS dataset
+    split : str
+        Dataset split (Train, Validation, Test)
+    cache_path : str, optional
+        Path to cache file. If None, uses default location.
+
+    Returns
+    -------
+    gt_boxes_cache : dict
+        Mapping from case_id to {'boxes': np.ndarray, 'volumes': list}
+    """
+    if cache_path is None:
+        cache_path = os.path.join(abus_root, f"gt_boxes_cache_{split.lower()}.json")
+
+    # Try to load existing cache
+    if os.path.exists(cache_path):
+        print(f"Loading GT boxes from cache: {cache_path}")
+        with open(cache_path, 'r') as f:
+            cache_data = json.load(f)
+        # Convert lists back to numpy arrays
+        gt_boxes_cache = {}
+        for case_id, data in cache_data.items():
+            gt_boxes_cache[case_id] = {
+                'boxes': np.array(data['boxes'], dtype=np.float32),
+                'volumes': data['volumes'],
+            }
+        print(f"  Loaded {len(gt_boxes_cache)} cached GT boxes")
+        return gt_boxes_cache
+
+    # Build cache from scratch
+    gt_mask_dir = os.path.join(abus_root, "data", split, "MASK")
+    if not os.path.exists(gt_mask_dir):
+        print(f"GT mask directory not found: {gt_mask_dir}")
+        return {}
+
+    mask_files = sorted([f for f in os.listdir(gt_mask_dir) if f.endswith('.nrrd')])
+    print(f"Building GT box cache from {len(mask_files)} masks...")
+    print(f"  (This is slow but only needs to be done once)")
+
+    gt_boxes_cache = {}
+    cache_data = {}
+
+    for mf in tqdm(mask_files, desc="Extracting GT boxes"):
+        # Extract case_id from filename like "MASK_001.nrrd"
+        case_id = mf.replace("MASK_", "").replace(".nrrd", "")
+
+        gt_path = os.path.join(gt_mask_dir, mf)
+        gt_itk = sitk.ReadImage(gt_path)
+        gt_mask = sitk.GetArrayFromImage(gt_itk).astype(np.uint8)
+
+        boxes, volumes = extract_boxes_from_mask(gt_mask)
+
+        gt_boxes_cache[case_id] = {
+            'boxes': boxes,
+            'volumes': volumes,
+        }
+        cache_data[case_id] = {
+            'boxes': boxes.tolist(),
+            'volumes': volumes,
+        }
+
+    # Save cache
+    with open(cache_path, 'w') as f:
+        json.dump(cache_data, f)
+    print(f"  Saved GT box cache to: {cache_path}")
+
+    return gt_boxes_cache
+
+
+def evaluate_detections(pred_dir, abus_root, split="Test", min_volume=100, gt_cache=None):
     """Evaluate detection metrics from segmentation predictions.
 
     Parameters
@@ -286,6 +361,9 @@ def evaluate_detections(pred_dir, abus_root, split="Test", min_volume=100):
         Dataset split (Train, Validation, Test)
     min_volume : int
         Minimum component volume to consider as detection
+    gt_cache : dict, optional
+        Pre-loaded GT boxes cache from build_gt_box_cache().
+        If None, will load from cache file or build from scratch.
 
     Returns
     -------
@@ -298,12 +376,15 @@ def evaluate_detections(pred_dir, abus_root, split="Test", min_volume=100):
         print(f"No .nii.gz files found in {pred_dir}")
         return None, None
 
-    gt_mask_dir = os.path.join(abus_root, "data", split, "MASK")
-    if not os.path.exists(gt_mask_dir):
-        print(f"GT mask directory not found: {gt_mask_dir}")
+    # Build or load GT box cache if not provided
+    if gt_cache is None:
+        gt_cache = build_gt_box_cache(abus_root, split)
+
+    if len(gt_cache) == 0:
+        print("No GT boxes available")
         return None, None
 
-    print(f"Evaluating {len(pred_files)} predictions against GT masks...")
+    print(f"Evaluating {len(pred_files)} predictions against {len(gt_cache)} cached GT boxes...")
 
     all_detections = {}
     case_results = []
@@ -339,17 +420,14 @@ def evaluate_detections(pred_dir, abus_root, split="Test", min_volume=100):
             score = min(1.0, vol / 10000.0)
             pred_scores.append(float(max(score, 0.01)))
 
-        # Load GT mask
-        gt_path = os.path.join(gt_mask_dir, f"MASK_{case_id}.nrrd")
-        if not os.path.exists(gt_path):
-            print(f"  Warning: GT not found for {case_name}, skipping")
+        # Get GT boxes from cache
+        if case_id not in gt_cache:
+            print(f"  Warning: GT not found in cache for {case_name}, skipping")
             continue
 
-        gt_itk = sitk.ReadImage(gt_path)
-        gt_mask = sitk.GetArrayFromImage(gt_itk).astype(np.uint8)
-
-        # Extract GT boxes
-        gt_boxes, gt_volumes = extract_boxes_from_mask(gt_mask)
+        gt_data = gt_cache[case_id]
+        gt_boxes = gt_data['boxes']
+        gt_volumes = gt_data['volumes']
 
         # Compute IoU matrix
         iou_matrix = compute_iou_matrix(pred_boxes, gt_boxes)
@@ -449,6 +527,8 @@ def main():
                         help="Run segmentation inference first")
     parser.add_argument("--min_volume", type=int, default=100,
                         help="Minimum component volume to consider as detection")
+    parser.add_argument("--rebuild_cache", action="store_true",
+                        help="Force rebuild GT box cache (slow, only needed once)")
     parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args()
 
@@ -459,9 +539,17 @@ def main():
             return
         run_inference(args.model_path, args.data_dir, args.pred_dir, args.device)
 
+    # Build or load GT box cache
+    cache_path = os.path.join(args.abus_root, f"gt_boxes_cache_{args.split.lower()}.json")
+    if args.rebuild_cache and os.path.exists(cache_path):
+        print(f"Removing existing cache: {cache_path}")
+        os.remove(cache_path)
+
+    gt_cache = build_gt_box_cache(args.abus_root, args.split, cache_path)
+
     # Evaluate
     results, detections = evaluate_detections(
-        args.pred_dir, args.abus_root, args.split, args.min_volume)
+        args.pred_dir, args.abus_root, args.split, args.min_volume, gt_cache=gt_cache)
 
     if results is None or detections is None:
         print("Evaluation failed. Check paths and try again.")
