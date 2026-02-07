@@ -199,11 +199,17 @@ python abus_patch_fusion_predict.py --model_path ./logs/segmamba_patch_fusion/mo
 #### Pipeline F: SegMamba-Retina (nnDetection-style) ⭐ **NEW**
 Anchor-based 3D RetinaNet with FPN, ATSS matching, and focal loss:
 ```bash
-# Train with pretrained segmentation weights
+# Train with pretrained segmentation weights (joint training)
 python abus_retina_train.py \
     --pretrained_seg ./logs/segmamba_abus/model/best_model.pt \
     --max_epoch 500 \
     --fg_ratio 0.5
+
+# Train detection only (freeze backbone, preserve seg quality)
+python abus_retina_train.py \
+    --pretrained_seg ./logs/segmamba_abus/model/best_model.pt \
+    --freeze_backbone \
+    --max_epoch 500
 
 # Inference with sliding window + NMS
 python abus_retina_predict.py \
@@ -235,6 +241,7 @@ Key features:
 - Biased patch sampling (50% foreground)
 - Detection loss warmup
 - Sliding window inference with global NMS
+- `--freeze_backbone` option to train detection only while preserving segmentation
 
 ### Detection Module
 

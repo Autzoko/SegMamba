@@ -985,6 +985,10 @@ def main():
     parser.add_argument("--full_volume_val", action="store_true",
                         help="Use full-volume sliding window validation (slower but accurate)")
 
+    # Freezing
+    parser.add_argument("--freeze_backbone", action="store_true",
+                        help="Freeze SegMamba backbone and seg decoder, only train detection head")
+
     # Misc
     parser.add_argument("--save_dir", type=str, default="./logs/segmamba_abus_retina")
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -1046,6 +1050,26 @@ def main():
     if args.pretrained_seg and os.path.exists(args.pretrained_seg):
         model = load_pretrained_segmamba(model, args.pretrained_seg)
 
+    # Freeze backbone and segmentation decoder if requested
+    if args.freeze_backbone:
+        print("\n=== FREEZING BACKBONE ===")
+        frozen_count = 0
+        trainable_count = 0
+
+        # Freeze: vit (MambaEncoder), encoder1-5, decoder1-5, seg_out
+        freeze_prefixes = ('vit.', 'encoder', 'decoder', 'seg_out.')
+
+        for name, param in model.named_parameters():
+            if any(name.startswith(prefix) for prefix in freeze_prefixes):
+                param.requires_grad = False
+                frozen_count += 1
+            else:
+                trainable_count += 1
+
+        print(f"  Frozen parameters: {frozen_count}")
+        print(f"  Trainable parameters: {trainable_count} (FPN + RetinaHead)")
+        print("  Only detection head will be updated during training.\n")
+
     # Detection components
     matcher = ATSSMatcher(
         num_candidates=args.atss_candidates,
@@ -1064,9 +1088,12 @@ def main():
         include_background=False,
     )
 
-    # Optimizer and scheduler
+    # Optimizer and scheduler (only trainable parameters)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(f"Optimizer will update {len(trainable_params)} parameter groups")
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
