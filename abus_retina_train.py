@@ -466,25 +466,136 @@ def train_epoch(
     }
 
 
+def compute_iou_3d(box1, box2):
+    """Compute 3D IoU between two boxes [x1, y1, x2, y2, z1, z2]."""
+    # Intersection
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    z1 = max(box1[4], box2[4])
+    z2 = min(box1[5], box2[5])
+
+    inter_w = max(0, x2 - x1)
+    inter_h = max(0, y2 - y1)
+    inter_d = max(0, z2 - z1)
+    inter_vol = inter_w * inter_h * inter_d
+
+    # Volumes
+    vol1 = (box1[2] - box1[0]) * (box1[3] - box1[1]) * (box1[5] - box1[4])
+    vol2 = (box2[2] - box2[0]) * (box2[3] - box2[1]) * (box2[5] - box2[4])
+
+    union = vol1 + vol2 - inter_vol
+    return inter_vol / (union + 1e-6)
+
+
+def compute_ap_recall(pred_boxes, pred_scores, gt_boxes, iou_threshold=0.25):
+    """
+    Compute AP and Recall for a single sample.
+
+    Args:
+        pred_boxes: list of [x1, y1, x2, y2, z1, z2]
+        pred_scores: list of scores
+        gt_boxes: list of [x1, y1, x2, y2, z1, z2]
+        iou_threshold: IoU threshold for matching
+
+    Returns:
+        ap: Average precision (simplified)
+        recall: Recall (TP / num_gt)
+        num_tp: True positives
+        num_fp: False positives
+        num_gt: Number of GT boxes
+    """
+    if len(gt_boxes) == 0:
+        # No GT boxes - all predictions are FP
+        return 0.0, 1.0, 0, len(pred_boxes), 0
+
+    if len(pred_boxes) == 0:
+        # No predictions - recall is 0
+        return 0.0, 0.0, 0, 0, len(gt_boxes)
+
+    # Sort predictions by score (descending)
+    sorted_indices = sorted(range(len(pred_scores)), key=lambda i: pred_scores[i], reverse=True)
+
+    gt_matched = [False] * len(gt_boxes)
+    tp = 0
+    fp = 0
+
+    precisions = []
+    recalls = []
+
+    for idx in sorted_indices:
+        pred_box = pred_boxes[idx]
+
+        # Find best matching GT
+        best_iou = 0
+        best_gt_idx = -1
+        for gt_idx, gt_box in enumerate(gt_boxes):
+            if gt_matched[gt_idx]:
+                continue
+            iou = compute_iou_3d(pred_box, gt_box)
+            if iou > best_iou:
+                best_iou = iou
+                best_gt_idx = gt_idx
+
+        if best_iou >= iou_threshold and best_gt_idx >= 0:
+            tp += 1
+            gt_matched[best_gt_idx] = True
+        else:
+            fp += 1
+
+        precision = tp / (tp + fp)
+        recall = tp / len(gt_boxes)
+        precisions.append(precision)
+        recalls.append(recall)
+
+    # Compute AP (area under precision-recall curve, simplified)
+    if len(precisions) > 0:
+        # Use all-point interpolation
+        ap = 0.0
+        for i in range(len(precisions)):
+            if i == 0:
+                ap += precisions[i] * recalls[i]
+            else:
+                ap += precisions[i] * (recalls[i] - recalls[i-1])
+    else:
+        ap = 0.0
+
+    final_recall = tp / len(gt_boxes) if len(gt_boxes) > 0 else 1.0
+
+    return ap, final_recall, tp, fp, len(gt_boxes)
+
+
 def validate(
     model: SegMambaWithRetina,
     dataloader: DataLoader,
     dice_loss_fn: nn.Module,
+    box_coder: BoxCoder3D,
     device: torch.device,
+    score_threshold: float = 0.3,
 ):
-    """Validate the model."""
+    """Validate the model with both segmentation and detection metrics."""
     model.eval()
 
     total_dice = 0.0
     total_seg_loss = 0.0
 
+    # Detection metrics accumulators
+    total_tp = {0.1: 0, 0.25: 0, 0.5: 0}
+    total_fp = {0.1: 0, 0.25: 0, 0.5: 0}
+    total_gt = 0
+    total_ap = {0.1: 0.0, 0.25: 0.0, 0.5: 0.0}
+    num_samples_with_gt = 0
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating"):
             images = batch['image'].to(device)
             masks = batch['mask'].to(device)
+            gt_boxes_batch = batch['boxes']  # (B, max_boxes, 6)
+            num_boxes_batch = batch['num_boxes']  # (B,)
 
             with autocast():
-                outputs = model(images, return_seg=True, return_det=False)
+                outputs = model(images, return_seg=True, return_det=True)
                 seg_logits = outputs['seg_logits']
 
                 ce_loss = F.cross_entropy(seg_logits, masks)
@@ -500,10 +611,74 @@ def validate(
             total_seg_loss += seg_loss.item()
             total_dice += dice.item()
 
+            # Detection evaluation
+            cls_flat, box_flat, ctr_flat, num_per_level = reshape_head_outputs(
+                outputs['cls_logits'],
+                outputs['box_deltas'],
+                outputs['centerness'],
+                model.num_anchors,
+                model.num_classes,
+            )
+            anchors = outputs['anchors']
+
+            batch_size = images.shape[0]
+            for b in range(batch_size):
+                # Get predictions for this sample
+                cls_scores = torch.sigmoid(cls_flat[b].view(-1))
+                ctr_scores = torch.sigmoid(ctr_flat[b].view(-1))
+                scores = cls_scores * ctr_scores
+
+                # Filter by score
+                keep = scores > score_threshold
+                if keep.sum() > 0:
+                    kept_scores = scores[keep].cpu().numpy()
+                    kept_deltas = box_flat[b][keep]
+                    kept_anchors = anchors[keep]
+
+                    # Decode boxes
+                    pred_boxes = box_coder.decode(kept_deltas, kept_anchors).cpu().numpy()
+                    pred_boxes = pred_boxes.tolist()
+                    pred_scores = kept_scores.tolist()
+                else:
+                    pred_boxes = []
+                    pred_scores = []
+
+                # Get GT boxes for this sample
+                n_gt = int(num_boxes_batch[b].item())
+                if n_gt > 0:
+                    gt_boxes = gt_boxes_batch[b, :n_gt].numpy().tolist()
+                    total_gt += n_gt
+                    num_samples_with_gt += 1
+                else:
+                    gt_boxes = []
+
+                # Compute metrics at different IoU thresholds
+                for iou_thresh in [0.1, 0.25, 0.5]:
+                    ap, recall, tp, fp, _ = compute_ap_recall(
+                        pred_boxes, pred_scores, gt_boxes, iou_thresh
+                    )
+                    total_tp[iou_thresh] += tp
+                    total_fp[iou_thresh] += fp
+                    if n_gt > 0:
+                        total_ap[iou_thresh] += ap
+
     n = len(dataloader)
+
+    # Compute final detection metrics
+    det_metrics = {}
+    for iou_thresh in [0.1, 0.25, 0.5]:
+        recall = total_tp[iou_thresh] / max(total_gt, 1)
+        precision = total_tp[iou_thresh] / max(total_tp[iou_thresh] + total_fp[iou_thresh], 1)
+        avg_ap = total_ap[iou_thresh] / max(num_samples_with_gt, 1)
+
+        det_metrics[f'recall@{iou_thresh}'] = recall
+        det_metrics[f'precision@{iou_thresh}'] = precision
+        det_metrics[f'ap@{iou_thresh}'] = avg_ap
+
     return {
         'seg_loss': total_seg_loss / n,
         'dice': total_dice / n,
+        **det_metrics,
     }
 
 
@@ -565,7 +740,7 @@ def main():
     )
     val_dataset = ABUSRetinaDataset(
         args.data_dir_val,
-        fg_ratio=0.0,  # Random sampling for validation
+        fg_ratio=0.5,  # Same as training to get meaningful detection metrics
     )
 
     train_loader = DataLoader(
@@ -646,7 +821,7 @@ def main():
         scheduler.step()
 
         # Validation
-        val_metrics = validate(model, val_loader, dice_loss_fn, device)
+        val_metrics = validate(model, val_loader, dice_loss_fn, box_coder, device)
 
         print(f"\nEpoch {epoch}/{args.max_epoch}")
         print(f"  Train: loss={train_metrics['loss']:.4f}, "
@@ -657,8 +832,14 @@ def main():
               f"avg_pos={train_metrics['avg_pos']:.1f}")
         print(f"  Val: seg_loss={val_metrics['seg_loss']:.4f}, "
               f"dice={val_metrics['dice']:.4f}")
+        print(f"  Det: recall@0.25={val_metrics['recall@0.25']:.4f}, "
+              f"precision@0.25={val_metrics['precision@0.25']:.4f}, "
+              f"AP@0.25={val_metrics['ap@0.25']:.4f}")
+        print(f"       recall@0.5={val_metrics['recall@0.5']:.4f}, "
+              f"precision@0.5={val_metrics['precision@0.5']:.4f}, "
+              f"AP@0.5={val_metrics['ap@0.5']:.4f}")
 
-        # Save best model
+        # Save best model (based on Dice)
         if val_metrics['dice'] > best_dice:
             best_dice = val_metrics['dice']
             torch.save(
