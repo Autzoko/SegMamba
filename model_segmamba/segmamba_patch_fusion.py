@@ -24,16 +24,15 @@ from .segmamba import SegMamba
 class PatchBoxHead(nn.Module):
     """Predicts box, objectness, and quality from patch features.
 
-    For each patch, outputs:
-      - box: (B, 6) normalized [cz, cy, cx, dz, dy, dx] in local patch coords
-      - objectness: (B, 1) probability that patch contains (part of) target
-      - quality: (B, 1) prediction reliability score
+    Box Output Format (CORNER format for guaranteed validity):
+      - box: (B, 6) normalized corners [z1, y1, x1, z2, y2, x2] in LOCAL patch coords
+      - All values in [0, 1] via sigmoid, then sorted to ensure z1 < z2, etc.
+      - 0.0 = patch start, 1.0 = patch end (normalized to patch size)
 
     Coordinate Convention:
-      - Center (cz, cy, cx): Normalized to patch size. 0.5 = patch center.
-        Range [-0.5, 1.5] allows predicting boxes extending beyond patch.
-      - Dimensions (dz, dy, dx): Normalized to patch size. 1.0 = full patch size (128).
-        Range (0, 2] ensures positive dimensions, max 2x patch size.
+      - LOCAL coordinates: normalized [0, 1] within the patch
+      - z1=0, z2=1 means the box spans the entire patch in z-direction
+      - The transform function converts to GLOBAL voxel coordinates
 
     Positional Encoding:
       - Patch position in global volume is injected as additional features
@@ -62,6 +61,7 @@ class PatchBoxHead(nn.Module):
         )
 
         # Prediction heads - input is hidden_dim * 2 (features + position)
+        # Output 6 values for corners: z1, y1, x1, z2, y2, x2
         self.box_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, 128),
             nn.ReLU(inplace=True),
@@ -88,7 +88,7 @@ class PatchBoxHead(nn.Module):
             volume_shape: (3,) or None, full volume shape [D, H, W] for normalization
 
         Returns:
-            box: (B, 6) normalized box params [cz, cy, cx, dz, dy, dx]
+            box: (B, 6) normalized CORNER format [z1, y1, x1, z2, y2, x2] in [0,1]
             objectness: (B, 1) sigmoid probability
             quality: (B, 1) sigmoid probability
         """
@@ -105,12 +105,12 @@ class PatchBoxHead(nn.Module):
         # Position encoding
         if patch_pos is not None and volume_shape is not None:
             # Normalize positions to [0, 1] based on volume shape
-            volume_shape = torch.as_tensor(volume_shape, dtype=feat.dtype, device=feat.device)
+            volume_shape_t = torch.as_tensor(volume_shape, dtype=feat.dtype, device=feat.device)
             patch_size_t = torch.tensor(patch_size, dtype=feat.dtype, device=feat.device)
 
             # Compute normalized start and end positions
-            pos_start = patch_pos / volume_shape  # (B, 3) in [0, 1]
-            pos_end = (patch_pos + patch_size_t) / volume_shape  # (B, 3)
+            pos_start = patch_pos / volume_shape_t  # (B, 3) in [0, 1]
+            pos_end = (patch_pos + patch_size_t) / volume_shape_t  # (B, 3)
             pos_end = pos_end.clamp(max=1.0)  # Clamp for edge patches
 
             pos_info = torch.cat([pos_start, pos_end], dim=1)  # (B, 6)
@@ -122,19 +122,25 @@ class PatchBoxHead(nn.Module):
         # Concatenate features and position encoding
         x = torch.cat([x, pos_feat], dim=1)  # (B, hidden_dim * 2)
 
-        # Predictions
+        # Box prediction in CORNER format
         box_raw = self.box_head(x)  # (B, 6)
 
-        # Apply constraints to box parameters
-        # Center (first 3): sigmoid * 2 - 0.5 → range [-0.5, 1.5]
-        #   Allows predicting centers outside patch for partially visible targets
-        center = torch.sigmoid(box_raw[:, :3]) * 2 - 0.5
+        # Apply sigmoid to constrain to [0, 1]
+        box_sigmoid = torch.sigmoid(box_raw)  # (B, 6) all in [0, 1]
 
-        # Dimensions (last 3): sigmoid * 2 + eps → range (0, 2]
-        #   Must be positive, max 2x patch size (256 voxels)
-        dims = torch.sigmoid(box_raw[:, 3:]) * 2 + 0.01  # eps=0.01 ensures positive
+        # Sort to ensure valid boxes: z1 < z2, y1 < y2, x1 < x2
+        z1, z2 = torch.min(box_sigmoid[:, 0], box_sigmoid[:, 3]), torch.max(box_sigmoid[:, 0], box_sigmoid[:, 3])
+        y1, y2 = torch.min(box_sigmoid[:, 1], box_sigmoid[:, 4]), torch.max(box_sigmoid[:, 1], box_sigmoid[:, 4])
+        x1, x2 = torch.min(box_sigmoid[:, 2], box_sigmoid[:, 5]), torch.max(box_sigmoid[:, 2], box_sigmoid[:, 5])
 
-        box = torch.cat([center, dims], dim=1)  # (B, 6)
+        # Ensure minimum box size (at least 5% of patch = ~6 voxels)
+        min_size = 0.05
+        z2 = torch.max(z2, z1 + min_size)
+        y2 = torch.max(y2, y1 + min_size)
+        x2 = torch.max(x2, x1 + min_size)
+
+        # Stack into corner format: [z1, y1, x1, z2, y2, x2]
+        box = torch.stack([z1, y1, x1, z2, y2, x2], dim=1)  # (B, 6)
 
         objectness = torch.sigmoid(self.objectness_head(x))  # (B, 1)
         quality = torch.sigmoid(self.quality_head(x))        # (B, 1)
@@ -252,23 +258,24 @@ class SegMambaWithPatchFusion(SegMamba):
 
 
 # ---------------------------------------------------------------------------
-# Fusion utilities
+# Fusion utilities - All functions use CORNER format [z1, y1, x1, z2, y2, x2]
 # ---------------------------------------------------------------------------
 
 def transform_box_to_global(box_local, patch_start, patch_size, volume_shape):
     """Transform local patch box to global volume coordinates.
 
+    IMPORTANT: Both input and output use CORNER format [z1, y1, x1, z2, y2, x2].
+
     Args:
-        box_local: (B, 6) or (6,) normalized [cz, cy, cx, dz, dy, dx]
+        box_local: (B, 6) or (6,) normalized corners [z1, y1, x1, z2, y2, x2] in [0,1]
         patch_start: (3,) or (B, 3) [z_start, y_start, x_start] in voxels
         patch_size: (3,) patch dimensions [D, H, W]
         volume_shape: (3,) full volume dimensions [D, H, W]
 
     Returns:
-        box_global: same shape as input, in global voxel coordinates
+        box_global: same shape as input, corners in global voxel coordinates
     """
     patch_size = torch.as_tensor(patch_size, dtype=box_local.dtype, device=box_local.device)
-    volume_shape = torch.as_tensor(volume_shape, dtype=box_local.dtype, device=box_local.device)
 
     if box_local.dim() == 1:
         box_local = box_local.unsqueeze(0)
@@ -282,27 +289,25 @@ def transform_box_to_global(box_local, patch_start, patch_size, volume_shape):
     if patch_start.dim() == 1:
         patch_start = patch_start.unsqueeze(0).expand(box_local.shape[0], -1)
 
-    # Unpack local box
-    cz_local = box_local[:, 0]
-    cy_local = box_local[:, 1]
-    cx_local = box_local[:, 2]
-    dz = box_local[:, 3]
-    dy = box_local[:, 4]
-    dx = box_local[:, 5]
+    # Unpack local corners (normalized [0, 1])
+    z1_local = box_local[:, 0]
+    y1_local = box_local[:, 1]
+    x1_local = box_local[:, 2]
+    z2_local = box_local[:, 3]
+    y2_local = box_local[:, 4]
+    x2_local = box_local[:, 5]
 
-    # Transform center to global (denormalize then add offset)
-    cz_global = patch_start[:, 0] + cz_local * patch_size[0]
-    cy_global = patch_start[:, 1] + cy_local * patch_size[1]
-    cx_global = patch_start[:, 2] + cx_local * patch_size[2]
-
-    # Dimensions stay the same but denormalize
-    dz_global = dz * patch_size[0]
-    dy_global = dy * patch_size[1]
-    dx_global = dx * patch_size[2]
+    # Transform corners to global: patch_start + normalized * patch_size
+    z1_global = patch_start[:, 0] + z1_local * patch_size[0]
+    y1_global = patch_start[:, 1] + y1_local * patch_size[1]
+    x1_global = patch_start[:, 2] + x1_local * patch_size[2]
+    z2_global = patch_start[:, 0] + z2_local * patch_size[0]
+    y2_global = patch_start[:, 1] + y2_local * patch_size[1]
+    x2_global = patch_start[:, 2] + x2_local * patch_size[2]
 
     box_global = torch.stack([
-        cz_global, cy_global, cx_global,
-        dz_global, dy_global, dx_global
+        z1_global, y1_global, x1_global,
+        z2_global, y2_global, x2_global
     ], dim=1)
 
     if squeeze_output:
@@ -314,13 +319,18 @@ def transform_box_to_global(box_local, patch_start, patch_size, volume_shape):
 def fuse_patch_boxes(boxes_global, objectness, quality, eps=1e-6):
     """Fuse multiple patch box predictions via soft-weighted aggregation.
 
+    Uses CORNER format throughout: [z1, y1, x1, z2, y2, x2].
+
+    The fusion converts corners to center format for averaging (since averaging
+    corners directly can produce invalid boxes), then converts back.
+
     Args:
-        boxes_global: (N, 6) boxes in global coordinates [cz, cy, cx, dz, dy, dx]
+        boxes_global: (N, 6) boxes in global CORNER format [z1, y1, x1, z2, y2, x2]
         objectness: (N, 1) objectness scores
         quality: (N, 1) quality scores
 
     Returns:
-        fused_box: (6,) weighted average box
+        fused_box: (6,) weighted average box in CORNER format
         weights: (N,) normalized fusion weights
     """
     # Ensure float32 for numerical stability
@@ -335,29 +345,56 @@ def fuse_patch_boxes(boxes_global, objectness, quality, eps=1e-6):
     weights_sum = weights.sum() + eps
     weights_norm = weights / weights_sum  # (N,)
 
-    # Weighted average of boxes
-    fused_box = (weights_norm.unsqueeze(-1) * boxes_global).sum(dim=0)  # (6,)
+    # Convert corners to center format for proper averaging
+    z1, y1, x1, z2, y2, x2 = boxes_global.unbind(dim=1)
+    cz = (z1 + z2) / 2
+    cy = (y1 + y2) / 2
+    cx = (x1 + x2) / 2
+    dz = z2 - z1
+    dy = y2 - y1
+    dx = x2 - x1
 
-    # Ensure dimensions are positive (clamp to minimum 1.0 voxel)
-    # Use torch.cat to avoid in-place operation that breaks autograd
-    fused_box = torch.cat([fused_box[:3], fused_box[3:].clamp(min=1.0)], dim=0)
+    # Weighted average of center and dimensions separately
+    cz_fused = (weights_norm * cz).sum()
+    cy_fused = (weights_norm * cy).sum()
+    cx_fused = (weights_norm * cx).sum()
+    dz_fused = (weights_norm * dz).sum()
+    dy_fused = (weights_norm * dy).sum()
+    dx_fused = (weights_norm * dx).sum()
+
+    # Ensure minimum size (at least 1.0 voxel)
+    dz_fused = dz_fused.clamp(min=1.0)
+    dy_fused = dy_fused.clamp(min=1.0)
+    dx_fused = dx_fused.clamp(min=1.0)
+
+    # Convert back to corners
+    z1_fused = cz_fused - dz_fused / 2
+    y1_fused = cy_fused - dy_fused / 2
+    x1_fused = cx_fused - dx_fused / 2
+    z2_fused = cz_fused + dz_fused / 2
+    y2_fused = cy_fused + dy_fused / 2
+    x2_fused = cx_fused + dx_fused / 2
+
+    fused_box = torch.stack([z1_fused, y1_fused, x1_fused, z2_fused, y2_fused, x2_fused])
 
     return fused_box, weights_norm
 
 
-def compute_patch_targets(patch_start, patch_size, gt_box_global, volume_shape):
+def compute_patch_targets(patch_start, patch_size, gt_box_global, volume_shape=None):
     """Compute supervision targets for a single patch.
+
+    Returns box targets in CORNER format for consistency with PatchBoxHead output.
 
     Args:
         patch_start: (3,) [z_start, y_start, x_start] in voxels
         patch_size: (3,) [D, H, W] patch dimensions
         gt_box_global: (6,) [z1, y1, x1, z2, y2, x2] corner format in global coords
-        volume_shape: (3,) full volume shape
+        volume_shape: (3,) full volume shape (unused, kept for API compatibility)
 
     Returns:
         objectness_gt: float, 1 if patch overlaps GT, 0 otherwise
         quality_gt: float, centerness score (0-1)
-        box_gt_local: (6,) box in normalized local coords [cz, cy, cx, dz, dy, dx]
+        box_gt_local: (6,) box in CORNER format, normalized to [0,1] in local coords
     """
     import numpy as np
 
@@ -377,10 +414,11 @@ def compute_patch_targets(patch_start, patch_size, gt_box_global, volume_shape):
     objectness_gt = 1.0 if has_overlap else 0.0
 
     if not has_overlap:
-        return objectness_gt, 0.0, np.zeros(6, dtype=np.float32)
+        # Return a default box at patch center with small size
+        return objectness_gt, 0.0, np.array([0.4, 0.4, 0.4, 0.6, 0.6, 0.6], dtype=np.float32)
 
     # Compute centerness (how centered is the visible GT within the patch)
-    # Clip GT to patch boundaries
+    # Clip GT to patch boundaries for centerness computation
     clipped_z1 = max(gz1, pz1) - pz1
     clipped_y1 = max(gy1, py1) - py1
     clipped_x1 = max(gx1, px1) - px1
@@ -410,20 +448,114 @@ def compute_patch_targets(patch_start, patch_size, gt_box_global, volume_shape):
     # Quality combines centerness and coverage
     quality_gt = float(np.sqrt(ctr_z * ctr_y * ctr_x * coverage))
 
-    # Box target: FULL GT box in local normalized coordinates
-    # (allows network to predict beyond patch boundaries)
-    gt_cz = ((gz1 + gz2) / 2 - pz1) / patch_size[0]
-    gt_cy = ((gy1 + gy2) / 2 - py1) / patch_size[1]
-    gt_cx = ((gx1 + gx2) / 2 - px1) / patch_size[2]
-    gt_dz = (gz2 - gz1) / patch_size[0]
-    gt_dy = (gy2 - gy1) / patch_size[1]
-    gt_dx = (gx2 - gx1) / patch_size[2]
+    # Box target: FULL GT box in local CORNER format, normalized to [0,1]
+    # Note: values can be outside [0,1] if box extends beyond patch
+    gt_z1_local = (gz1 - pz1) / patch_size[0]
+    gt_y1_local = (gy1 - py1) / patch_size[1]
+    gt_x1_local = (gx1 - px1) / patch_size[2]
+    gt_z2_local = (gz2 - pz1) / patch_size[0]
+    gt_y2_local = (gy2 - py1) / patch_size[1]
+    gt_x2_local = (gx2 - px1) / patch_size[2]
 
-    box_gt_local = np.array([gt_cz, gt_cy, gt_cx, gt_dz, gt_dy, gt_dx], dtype=np.float32)
+    # Clip to [0, 1] since network outputs are constrained to this range
+    gt_z1_local = np.clip(gt_z1_local, 0.0, 1.0)
+    gt_y1_local = np.clip(gt_y1_local, 0.0, 1.0)
+    gt_x1_local = np.clip(gt_x1_local, 0.0, 1.0)
+    gt_z2_local = np.clip(gt_z2_local, 0.0, 1.0)
+    gt_y2_local = np.clip(gt_y2_local, 0.0, 1.0)
+    gt_x2_local = np.clip(gt_x2_local, 0.0, 1.0)
+
+    box_gt_local = np.array([gt_z1_local, gt_y1_local, gt_x1_local,
+                              gt_z2_local, gt_y2_local, gt_x2_local], dtype=np.float32)
 
     return objectness_gt, quality_gt, box_gt_local
 
 
+def compute_giou_3d_corners(box1, box2):
+    """Compute 3D Generalized IoU between two boxes in CORNER format.
+
+    Args:
+        box1, box2: (..., 6) in [z1, y1, x1, z2, y2, x2] format
+
+    Returns:
+        giou: (...,) GIoU values in [-1, 1]
+    """
+    eps = 1e-6
+
+    # Unpack corners
+    b1_z1, b1_y1, b1_x1, b1_z2, b1_y2, b1_x2 = box1.unbind(-1)
+    b2_z1, b2_y1, b2_x1, b2_z2, b2_y2, b2_x2 = box2.unbind(-1)
+
+    # Ensure valid boxes (z1 < z2, etc.)
+    b1_z1, b1_z2 = torch.min(b1_z1, b1_z2), torch.max(b1_z1, b1_z2)
+    b1_y1, b1_y2 = torch.min(b1_y1, b1_y2), torch.max(b1_y1, b1_y2)
+    b1_x1, b1_x2 = torch.min(b1_x1, b1_x2), torch.max(b1_x1, b1_x2)
+    b2_z1, b2_z2 = torch.min(b2_z1, b2_z2), torch.max(b2_z1, b2_z2)
+    b2_y1, b2_y2 = torch.min(b2_y1, b2_y2), torch.max(b2_y1, b2_y2)
+    b2_x1, b2_x2 = torch.min(b2_x1, b2_x2), torch.max(b2_x1, b2_x2)
+
+    # Intersection
+    inter_z = torch.clamp(torch.min(b1_z2, b2_z2) - torch.max(b1_z1, b2_z1), min=0)
+    inter_y = torch.clamp(torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1), min=0)
+    inter_x = torch.clamp(torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1), min=0)
+    inter = inter_z * inter_y * inter_x
+
+    # Volumes
+    vol1 = (b1_z2 - b1_z1).clamp(min=eps) * (b1_y2 - b1_y1).clamp(min=eps) * (b1_x2 - b1_x1).clamp(min=eps)
+    vol2 = (b2_z2 - b2_z1).clamp(min=eps) * (b2_y2 - b2_y1).clamp(min=eps) * (b2_x2 - b2_x1).clamp(min=eps)
+    union = vol1 + vol2 - inter
+
+    iou = inter / union.clamp(min=eps)
+
+    # Enclosing box
+    enc_z = torch.max(b1_z2, b2_z2) - torch.min(b1_z1, b2_z1)
+    enc_y = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+    enc_x = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+    enc_vol = (enc_z * enc_y * enc_x).clamp(min=eps)
+
+    giou = iou - (enc_vol - union) / enc_vol
+
+    # Clamp output to valid range and handle NaN
+    giou = torch.clamp(giou, min=-1.0, max=1.0)
+    giou = torch.nan_to_num(giou, nan=0.0)
+
+    return giou
+
+
+def compute_iou_3d_corners(box1, box2):
+    """Compute 3D IoU between two boxes in CORNER format.
+
+    Args:
+        box1, box2: (..., 6) in [z1, y1, x1, z2, y2, x2] format
+
+    Returns:
+        iou: (...,) IoU values in [0, 1]
+    """
+    eps = 1e-6
+
+    # Unpack corners
+    b1_z1, b1_y1, b1_x1, b1_z2, b1_y2, b1_x2 = box1.unbind(-1)
+    b2_z1, b2_y1, b2_x1, b2_z2, b2_y2, b2_x2 = box2.unbind(-1)
+
+    # Intersection
+    inter_z = torch.clamp(torch.min(b1_z2, b2_z2) - torch.max(b1_z1, b2_z1), min=0)
+    inter_y = torch.clamp(torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1), min=0)
+    inter_x = torch.clamp(torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1), min=0)
+    inter = inter_z * inter_y * inter_x
+
+    # Volumes
+    vol1 = (b1_z2 - b1_z1).clamp(min=eps) * (b1_y2 - b1_y1).clamp(min=eps) * (b1_x2 - b1_x1).clamp(min=eps)
+    vol2 = (b2_z2 - b2_z1).clamp(min=eps) * (b2_y2 - b2_y1).clamp(min=eps) * (b2_x2 - b2_x1).clamp(min=eps)
+    union = vol1 + vol2 - inter
+
+    iou = inter / union.clamp(min=eps)
+    iou = torch.clamp(iou, min=0.0, max=1.0)
+    iou = torch.nan_to_num(iou, nan=0.0)
+
+    return iou
+
+
+# Keep old function for backward compatibility
 def box_cxcyczdhwd_to_corners(box):
     """Convert [cz, cy, cx, dz, dy, dx] to [z1, y1, x1, z2, y2, x2]."""
     cz, cy, cx, dz, dy, dx = box.unbind(-1)
@@ -438,6 +570,8 @@ def box_cxcyczdhwd_to_corners(box):
 
 def compute_giou_3d(box1, box2):
     """Compute 3D Generalized IoU between two boxes.
+
+    DEPRECATED: Use compute_giou_3d_corners for corner format boxes.
 
     Args:
         box1, box2: (..., 6) in [cz, cy, cx, dz, dy, dx] format

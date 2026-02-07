@@ -110,7 +110,7 @@ def predict_volume(model, volume, device, overlap=0.5, batch_size=4):
 
     Returns:
         seg_output: (2, D, H, W) softmax probabilities
-        fused_box: (6,) global box in voxel coordinates [cz, cy, cx, dz, dy, dx]
+        fused_box: (6,) global box in CORNER format [z1, y1, x1, z2, y2, x2]
         confidence: float, detection confidence
     """
     model.eval()
@@ -151,7 +151,7 @@ def predict_volume(model, volume, device, overlap=0.5, batch_size=4):
     # Aggregate segmentation
     seg_output = aggregate_segmentation(all_seg_patches, all_positions, volume_shape, PATCH_SIZE)
 
-    # Fuse detection predictions
+    # Fuse detection predictions (all boxes in CORNER format)
     boxes_local = torch.cat(all_boxes_local, dim=0)
     objectness = torch.cat(all_objectness, dim=0)
     quality = torch.cat(all_quality, dim=0)
@@ -164,16 +164,8 @@ def predict_volume(model, volume, device, overlap=0.5, batch_size=4):
 
     confidence = float((objectness * quality).max())
 
+    # fused_box is already in CORNER format [z1, y1, x1, z2, y2, x2]
     return seg_output, fused_box.numpy(), confidence
-
-
-def box_center_to_corners(box):
-    """Convert [cz, cy, cx, dz, dy, dx] to [z1, y1, x1, z2, y2, x2]."""
-    cz, cy, cx, dz, dy, dx = box
-    return [
-        cz - dz/2, cy - dy/2, cx - dx/2,
-        cz + dz/2, cy + dy/2, cx + dx/2
-    ]
 
 
 def main():
@@ -250,8 +242,8 @@ def main():
         seg_output, fused_box, confidence = predict_volume(
             model, volume, device, overlap=args.overlap)
 
-        # Convert box to corner format
-        box_corners = box_center_to_corners(fused_box)
+        # fused_box is already in CORNER format [z1, y1, x1, z2, y2, x2]
+        box_corners = list(fused_box)
 
         # Clip to volume bounds
         volume_shape = volume.shape[1:]

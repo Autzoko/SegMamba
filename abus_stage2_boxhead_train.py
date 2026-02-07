@@ -37,7 +37,8 @@ from model_segmamba.segmamba_patch_fusion import (
     transform_box_to_global,
     fuse_patch_boxes,
     compute_patch_targets,
-    compute_giou_3d,
+    compute_giou_3d_corners,
+    compute_iou_3d_corners,
 )
 
 PATCH_SIZE = (128, 128, 128)
@@ -197,15 +198,24 @@ def collate_fn(batch):
 
 
 # ---------------------------------------------------------------------------
-# Loss computation (detection only)
+# Loss computation (detection only) - Uses CORNER format throughout
 # ---------------------------------------------------------------------------
 
 def compute_detection_losses(boxes_local, objectness, quality,
-                              positions, gt_box, has_gt_box, volume_shape, device):
+                              positions, gt_box, has_gt_box, volume_shape, device,
+                              use_local_supervision=True, local_weight=0.5):
     """Compute detection losses for BoxHead training.
 
+    All boxes use CORNER format: [z1, y1, x1, z2, y2, x2].
+
+    Losses:
+      - Global detection: GIoU loss on fused box vs GT (primary)
+      - Local supervision: L1 + GIoU on each overlapping patch's local prediction
+      - Objectness: BCE per patch
+      - Quality: MSE per patch (for overlapping patches only)
+
     Returns:
-        losses: dict with det_loss, obj_loss, qual_loss, total
+        losses: dict with det_loss, local_loss, obj_loss, qual_loss, total
         metrics: dict with monitoring values
     """
     N = boxes_local.shape[0]
@@ -219,56 +229,85 @@ def compute_detection_losses(boxes_local, objectness, quality,
 
         return {
             'det_loss': torch.tensor(0.0, device=device),
+            'local_loss': torch.tensor(0.0, device=device),
             'obj_loss': obj_loss,
             'qual_loss': torch.tensor(0.0, device=device),
             'total': obj_loss,
         }, {
             'objectness_mean': objectness.mean().item(),
             'quality_mean': quality.mean().item(),
+            'giou': 0.0,
+            'iou': 0.0,
         }
 
-    # Transform boxes to global coordinates
+    # Transform boxes to global coordinates (CORNER format)
     boxes_global = transform_box_to_global(
         boxes_local, positions, PATCH_SIZE, volume_shape.tolist())
-
-    # Fuse patch boxes
-    fused_box, _ = fuse_patch_boxes(boxes_global, objectness, quality)
 
     # Compute per-patch targets for auxiliary losses
     gt_box_np = gt_box.cpu().numpy()
     obj_targets = []
     qual_targets = []
+    box_targets_local = []  # For local supervision
 
     for i in range(N):
         pos = positions[i].cpu().numpy().astype(int)
-        obj_gt, qual_gt, _ = compute_patch_targets(
-            pos, PATCH_SIZE, gt_box_np, volume_shape.cpu().numpy().astype(int))
+        obj_gt, qual_gt, box_gt_local = compute_patch_targets(
+            pos, PATCH_SIZE, gt_box_np)
         obj_targets.append(obj_gt)
         qual_targets.append(qual_gt)
+        box_targets_local.append(box_gt_local)
 
     obj_targets = torch.tensor(obj_targets, device=device, dtype=torch.float32).unsqueeze(1)
     qual_targets = torch.tensor(qual_targets, device=device, dtype=torch.float32).unsqueeze(1)
+    box_targets_local = torch.tensor(np.stack(box_targets_local), device=device, dtype=torch.float32)
 
-    # Detection loss on fused box
-    gt_cz = (gt_box[0] + gt_box[3]) / 2
-    gt_cy = (gt_box[1] + gt_box[4]) / 2
-    gt_cx = (gt_box[2] + gt_box[5]) / 2
-    gt_dz = gt_box[3] - gt_box[0]
-    gt_dy = gt_box[4] - gt_box[1]
-    gt_dx = gt_box[5] - gt_box[2]
-    gt_box_center = torch.stack([gt_cz, gt_cy, gt_cx, gt_dz, gt_dy, gt_dx])
+    # Find overlapping patches for global fusion and local supervision
+    has_overlap = obj_targets.squeeze(-1) > 0.5  # (N,) bool
 
+    # Only use overlapping patches for fusion (simplified strategy)
+    if has_overlap.sum() > 0:
+        overlap_indices = has_overlap.nonzero(as_tuple=True)[0]
+        boxes_overlap = boxes_global[overlap_indices]
+        obj_overlap = objectness[overlap_indices]
+        qual_overlap = quality[overlap_indices]
+
+        # Fuse only overlapping patch boxes
+        fused_box, _ = fuse_patch_boxes(boxes_overlap, obj_overlap, qual_overlap)
+    else:
+        # Fallback: fuse all patches (shouldn't happen if patches are sampled correctly)
+        fused_box, _ = fuse_patch_boxes(boxes_global, objectness, quality)
+
+    # Global detection loss (CORNER format)
+    gt_box_f32 = gt_box.float()
     fused_box_f32 = fused_box.float()
-    gt_box_center_f32 = gt_box_center.float()
 
-    # L1 loss
-    l1_loss = F.smooth_l1_loss(fused_box_f32, gt_box_center_f32)
-
-    # GIoU loss
-    giou = compute_giou_3d(fused_box_f32, gt_box_center_f32)
+    # GIoU loss (primary)
+    giou = compute_giou_3d_corners(fused_box_f32, gt_box_f32)
+    iou = compute_iou_3d_corners(fused_box_f32, gt_box_f32)
     giou_loss = 1 - giou
 
-    det_loss = (l1_loss + giou_loss).clamp(max=10.0)
+    det_loss = giou_loss.clamp(max=2.0)
+
+    # Local supervision loss (for overlapping patches only)
+    local_loss = torch.tensor(0.0, device=device)
+    if use_local_supervision and has_overlap.sum() > 0:
+        overlap_indices = has_overlap.nonzero(as_tuple=True)[0]
+
+        for idx in overlap_indices:
+            pred_local = boxes_local[idx]  # (6,) normalized corners
+            target_local = box_targets_local[idx]  # (6,) normalized corners
+
+            # L1 loss on normalized coordinates
+            l1 = F.smooth_l1_loss(pred_local, target_local)
+
+            # GIoU loss on local boxes (both in normalized [0,1] space)
+            local_giou = compute_giou_3d_corners(pred_local.unsqueeze(0), target_local.unsqueeze(0))
+            local_giou_loss = 1 - local_giou
+
+            local_loss = local_loss + l1 + local_giou_loss.squeeze()
+
+        local_loss = local_loss / has_overlap.sum().float()
 
     # Objectness BCE
     objectness_clamped = objectness.float().clamp(1e-4, 1 - 1e-4)
@@ -276,16 +315,16 @@ def compute_detection_losses(boxes_local, objectness, quality,
     obj_loss = F.binary_cross_entropy_with_logits(objectness_logits, obj_targets.float())
 
     # Quality loss (only for patches with GT overlap)
-    has_overlap = obj_targets > 0.5
     if has_overlap.any():
         qual_loss = F.mse_loss(quality[has_overlap].float(), qual_targets[has_overlap].float())
     else:
         qual_loss = torch.tensor(0.0, device=device)
 
-    total = det_loss + obj_loss + qual_loss
+    total = det_loss + local_weight * local_loss + obj_loss + qual_loss
 
     return {
         'det_loss': det_loss,
+        'local_loss': local_loss,
         'obj_loss': obj_loss,
         'qual_loss': qual_loss,
         'total': total,
@@ -293,7 +332,7 @@ def compute_detection_losses(boxes_local, objectness, quality,
         'objectness_mean': objectness.mean().item(),
         'quality_mean': quality.mean().item(),
         'giou': giou.item(),
-        'l1': l1_loss.item(),
+        'iou': iou.item(),
         'n_overlap_patches': has_overlap.sum().item(),
     }
 
@@ -302,7 +341,7 @@ def compute_detection_losses(boxes_local, objectness, quality,
 # Training
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, optimizer, device):
+def train_one_epoch(model, loader, optimizer, device, local_weight=0.5):
     """Train one epoch (BoxHead only, backbone frozen).
 
     Note: AMP is disabled for Stage 2 because the BoxHead is small (~0.5M params)
@@ -311,7 +350,8 @@ def train_one_epoch(model, loader, optimizer, device):
     # Keep model in eval mode for frozen backbone, but BoxHead will still train
     model.eval()
 
-    total_losses = {'det_loss': 0, 'obj_loss': 0, 'qual_loss': 0, 'total': 0}
+    total_losses = {'det_loss': 0, 'local_loss': 0, 'obj_loss': 0, 'qual_loss': 0, 'total': 0}
+    total_metrics = {'giou': 0, 'iou': 0}
     num_samples = 0
     nan_batches = 0
 
@@ -337,7 +377,8 @@ def train_one_epoch(model, loader, optimizer, device):
 
         losses, metrics = compute_detection_losses(
             boxes_local, objectness, quality,
-            positions, gt_box, has_gt_box, volume_shape, device)
+            positions, gt_box, has_gt_box, volume_shape, device,
+            use_local_supervision=True, local_weight=local_weight)
 
         # Check for NaN in loss
         if torch.isnan(losses['total']) or torch.isinf(losses['total']):
@@ -364,21 +405,26 @@ def train_one_epoch(model, loader, optimizer, device):
 
         for k in total_losses:
             total_losses[k] += losses[k].item()
+        for k in total_metrics:
+            total_metrics[k] += metrics[k]
         num_samples += 1
 
     if nan_batches > 0:
         print(f"  Skipped {nan_batches} batches due to NaN")
 
-    return {k: v / max(num_samples, 1) for k, v in total_losses.items()}
+    avg_losses = {k: v / max(num_samples, 1) for k, v in total_losses.items()}
+    avg_metrics = {k: v / max(num_samples, 1) for k, v in total_metrics.items()}
+
+    return {**avg_losses, **avg_metrics}
 
 
 # ---------------------------------------------------------------------------
-# Validation
+# Validation - Uses CORNER format throughout
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def validate(model, loader, device):
-    """Validate detection performance."""
+    """Validate detection performance using corner format boxes."""
     model.eval()
 
     giou_list = []
@@ -398,27 +444,44 @@ def validate(model, loader, device):
         seg_logits, boxes_local, objectness, quality = model.forward_boxhead_only(
             patches, patch_pos=positions, volume_shape=volume_shape)
 
+        # Transform to global CORNER format
         boxes_global = transform_box_to_global(
             boxes_local, positions, PATCH_SIZE, volume_shape.tolist())
-        fused_box, _ = fuse_patch_boxes(boxes_global, objectness, quality)
 
-        # Convert GT to center format
-        gt_cz = (gt_box[0] + gt_box[3]) / 2
-        gt_cy = (gt_box[1] + gt_box[4]) / 2
-        gt_cx = (gt_box[2] + gt_box[5]) / 2
-        gt_dz = gt_box[3] - gt_box[0]
-        gt_dy = gt_box[4] - gt_box[1]
-        gt_dx = gt_box[5] - gt_box[2]
-        gt_box_center = torch.stack([gt_cz, gt_cy, gt_cx, gt_dz, gt_dy, gt_dx])
+        # Only use overlapping patches for fusion (consistent with training)
+        gt_box_np = gt_box.cpu().numpy()
+        has_overlap = []
+        for i in range(boxes_local.shape[0]):
+            pos = positions[i].cpu().numpy().astype(int)
+            obj_gt, _, _ = compute_patch_targets(pos, PATCH_SIZE, gt_box_np)
+            has_overlap.append(obj_gt > 0.5)
 
-        if gt_dz > 0 and gt_dy > 0 and gt_dx > 0:
-            giou = compute_giou_3d(fused_box, gt_box_center)
+        has_overlap = torch.tensor(has_overlap, device=device)
+
+        if has_overlap.sum() > 0:
+            overlap_indices = has_overlap.nonzero(as_tuple=True)[0]
+            boxes_overlap = boxes_global[overlap_indices]
+            obj_overlap = objectness[overlap_indices]
+            qual_overlap = quality[overlap_indices]
+            fused_box, _ = fuse_patch_boxes(boxes_overlap, obj_overlap, qual_overlap)
+        else:
+            fused_box, _ = fuse_patch_boxes(boxes_global, objectness, quality)
+
+        # Both fused_box and gt_box are in CORNER format
+        gt_box_f32 = gt_box.float()
+        fused_box_f32 = fused_box.float()
+
+        # Validate GT box
+        if (gt_box[3] > gt_box[0]) and (gt_box[4] > gt_box[1]) and (gt_box[5] > gt_box[2]):
+            giou = compute_giou_3d_corners(fused_box_f32, gt_box_f32)
+            iou = compute_iou_3d_corners(fused_box_f32, gt_box_f32)
+
             giou_val = giou.item()
+            iou_val = iou.item()
 
-            if not np.isnan(giou_val):
+            if not np.isnan(giou_val) and not np.isnan(iou_val):
                 giou_list.append(giou_val)
-                iou = (giou_val + 1) / 2
-                iou_list.append(max(0, min(1, iou)))
+                iou_list.append(iou_val)
 
     return {
         'giou': np.mean(giou_list) if giou_list else 0.0,
@@ -461,6 +524,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--lr", type=float, default=0.001,
                         help="Learning rate for BoxHead (lower than Stage 1)")
+    parser.add_argument("--local_weight", type=float, default=0.5,
+                        help="Weight for local patch supervision loss")
     parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
@@ -538,18 +603,19 @@ if __name__ == "__main__":
     print(f"{'='*60}\n")
 
     for epoch in range(args.max_epoch):
-        losses = train_one_epoch(model, train_loader, optimizer, device)
+        results = train_one_epoch(model, train_loader, optimizer, device, args.local_weight)
         scheduler.step(epoch)
 
         lr_now = optimizer.param_groups[0]['lr']
 
-        for k, v in losses.items():
+        for k, v in results.items():
             writer.add_scalar(f"train/{k}", v, epoch)
         writer.add_scalar("train/lr", lr_now, epoch)
 
-        print(f"  [epoch {epoch:3d}]  total={losses['total']:.4f}  "
-              f"det={losses['det_loss']:.4f}  obj={losses['obj_loss']:.4f}  "
-              f"qual={losses['qual_loss']:.4f}  lr={lr_now:.6f}")
+        print(f"  [epoch {epoch:3d}]  total={results['total']:.4f}  "
+              f"det={results['det_loss']:.4f}  local={results['local_loss']:.4f}  "
+              f"obj={results['obj_loss']:.4f}  qual={results['qual_loss']:.4f}  "
+              f"GIoU={results['giou']:.4f}  IoU={results['iou']:.4f}  lr={lr_now:.6f}")
 
         if (epoch + 1) % args.val_every == 0:
             metrics = validate(model, val_loader, device)

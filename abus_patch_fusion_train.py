@@ -37,7 +37,8 @@ from model_segmamba.segmamba_patch_fusion import (
     transform_box_to_global,
     fuse_patch_boxes,
     compute_patch_targets,
-    compute_giou_3d,
+    compute_giou_3d_corners,
+    compute_iou_3d_corners,
 )
 
 PATCH_SIZE = (128, 128, 128)
@@ -224,16 +225,19 @@ def fusion_collate_fn(batch):
 
 
 # ---------------------------------------------------------------------------
-# Loss computation
+# Loss computation - Uses CORNER format throughout
 # ---------------------------------------------------------------------------
 
 def compute_losses(seg_logits, boxes_local, objectness, quality,
                    seg_gts, positions, gt_box, has_gt_box, volume_shape,
-                   dice_loss_fn, ce_loss_fn, device):
+                   dice_loss_fn, ce_loss_fn, device, use_local_supervision=True,
+                   local_weight=0.5):
     """Compute all losses for one volume's patches.
 
+    All boxes use CORNER format: [z1, y1, x1, z2, y2, x2].
+
     Returns:
-        losses: dict with seg_loss, det_loss, obj_loss, qual_loss, total
+        losses: dict with seg_loss, det_loss, local_loss, obj_loss, qual_loss, total
         metrics: dict with useful monitoring values
     """
     N = seg_logits.shape[0]
@@ -254,72 +258,92 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
         return {
             'seg_loss': seg_loss,
             'det_loss': torch.tensor(0.0, device=device),
+            'local_loss': torch.tensor(0.0, device=device),
             'obj_loss': torch.tensor(0.0, device=device),
             'qual_loss': torch.tensor(0.0, device=device),
             'total': seg_loss,
         }, {
             'objectness_mean': objectness.mean().item(),
             'quality_mean': quality.mean().item(),
+            'giou': 0.0,
+            'iou': 0.0,
         }
 
-    # --- Transform boxes to global coordinates ---
+    # --- Transform boxes to global coordinates (CORNER format) ---
     boxes_global = transform_box_to_global(
         boxes_local, positions, PATCH_SIZE, volume_shape.tolist())
-
-    # --- Fuse patch boxes ---
-    fused_box, _ = fuse_patch_boxes(boxes_global, objectness, quality)
 
     # --- Compute per-patch targets for auxiliary losses ---
     gt_box_np = gt_box.cpu().numpy()
     obj_targets = []
     qual_targets = []
+    box_targets_local = []
 
     for i in range(N):
         pos = positions[i].cpu().numpy().astype(int)
-        obj_gt, qual_gt, _ = compute_patch_targets(
-            pos, PATCH_SIZE, gt_box_np, volume_shape.cpu().numpy().astype(int))
+        obj_gt, qual_gt, box_gt_local = compute_patch_targets(pos, PATCH_SIZE, gt_box_np)
         obj_targets.append(obj_gt)
         qual_targets.append(qual_gt)
+        box_targets_local.append(box_gt_local)
 
     obj_targets = torch.tensor(obj_targets, device=device, dtype=torch.float32).unsqueeze(1)
     qual_targets = torch.tensor(qual_targets, device=device, dtype=torch.float32).unsqueeze(1)
+    box_targets_local = torch.tensor(np.stack(box_targets_local), device=device, dtype=torch.float32)
 
-    # --- Detection loss on fused box ---
-    # Convert GT box from corner to center format
-    gt_cz = (gt_box[0] + gt_box[3]) / 2
-    gt_cy = (gt_box[1] + gt_box[4]) / 2
-    gt_cx = (gt_box[2] + gt_box[5]) / 2
-    gt_dz = gt_box[3] - gt_box[0]
-    gt_dy = gt_box[4] - gt_box[1]
-    gt_dx = gt_box[5] - gt_box[2]
-    gt_box_center = torch.stack([gt_cz, gt_cy, gt_cx, gt_dz, gt_dy, gt_dx])
+    # Find overlapping patches
+    has_overlap = obj_targets.squeeze(-1) > 0.5  # (N,) bool
 
-    # Use float32 for stability
+    # --- Fuse only overlapping patch boxes (simplified strategy) ---
+    if has_overlap.sum() > 0:
+        overlap_indices = has_overlap.nonzero(as_tuple=True)[0]
+        boxes_overlap = boxes_global[overlap_indices]
+        obj_overlap = objectness[overlap_indices]
+        qual_overlap = quality[overlap_indices]
+        fused_box, _ = fuse_patch_boxes(boxes_overlap, obj_overlap, qual_overlap)
+    else:
+        # Fallback: fuse all patches
+        fused_box, _ = fuse_patch_boxes(boxes_global, objectness, quality)
+
+    # --- Detection loss on fused box (CORNER format) ---
+    gt_box_f32 = gt_box.float()
     fused_box_f32 = fused_box.float()
-    gt_box_center_f32 = gt_box_center.float()
 
-    # L1 loss
-    l1_loss = F.smooth_l1_loss(fused_box_f32, gt_box_center_f32)
-
-    # GIoU loss
-    giou = compute_giou_3d(fused_box_f32, gt_box_center_f32)
+    # GIoU loss (primary)
+    giou = compute_giou_3d_corners(fused_box_f32, gt_box_f32)
+    iou = compute_iou_3d_corners(fused_box_f32, gt_box_f32)
     giou_loss = 1 - giou
 
     # Clamp detection loss to avoid extreme values
-    det_loss = (l1_loss + giou_loss).clamp(max=10.0)
+    det_loss = giou_loss.clamp(max=2.0)
+
+    # --- Local supervision loss (for overlapping patches only) ---
+    local_loss = torch.tensor(0.0, device=device)
+    if use_local_supervision and has_overlap.sum() > 0:
+        overlap_indices = has_overlap.nonzero(as_tuple=True)[0]
+
+        for idx in overlap_indices:
+            pred_local = boxes_local[idx]  # (6,) normalized corners
+            target_local = box_targets_local[idx]  # (6,) normalized corners
+
+            # L1 loss on normalized coordinates
+            l1 = F.smooth_l1_loss(pred_local, target_local)
+
+            # GIoU loss on local boxes
+            local_giou = compute_giou_3d_corners(pred_local.unsqueeze(0), target_local.unsqueeze(0))
+            local_giou_loss = 1 - local_giou
+
+            local_loss = local_loss + l1 + local_giou_loss.squeeze()
+
+        local_loss = local_loss / has_overlap.sum().float()
 
     # --- Auxiliary losses ---
-    # Objectness BCE (use logits version for AMP compatibility)
-    # Since objectness is already sigmoid, convert back to logits with numerical stability
-    # Clamp to avoid extreme values that cause NaN under float16
+    # Objectness BCE
     objectness_clamped = objectness.float().clamp(1e-4, 1 - 1e-4)
     objectness_logits = torch.log(objectness_clamped / (1 - objectness_clamped))
     obj_loss = F.binary_cross_entropy_with_logits(objectness_logits, obj_targets.float())
 
     # Quality loss (only for patches with GT overlap)
-    has_overlap = obj_targets > 0.5
     if has_overlap.any():
-        # Use float32 for numerical stability
         qual_loss = F.mse_loss(quality[has_overlap].float(), qual_targets[has_overlap].float())
     else:
         qual_loss = torch.tensor(0.0, device=device)
@@ -327,6 +351,7 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
     return {
         'seg_loss': seg_loss,
         'det_loss': det_loss,
+        'local_loss': local_loss,
         'obj_loss': obj_loss,
         'qual_loss': qual_loss,
         # Note: total loss is computed in training loop with warmup
@@ -334,6 +359,7 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
         'objectness_mean': objectness.mean().item(),
         'quality_mean': quality.mean().item(),
         'giou': giou.item(),
+        'iou': iou.item(),
         'n_overlap_patches': has_overlap.sum().item(),
     }
 
@@ -344,16 +370,18 @@ def compute_losses(seg_logits, boxes_local, objectness, quality,
 
 def train_one_epoch(model, loader, optimizer, device, scaler,
                     dice_loss_fn, ce_loss_fn, epoch=0, warmup_epochs=50,
-                    det_weight=1.0, aux_weight=0.5):
+                    det_weight=1.0, aux_weight=0.5, local_weight=0.5):
     """Train one epoch with detection loss warmup.
 
     Args:
         warmup_epochs: Number of epochs for detection warmup (0 = no warmup)
         det_weight: Weight for detection loss after warmup
         aux_weight: Weight for auxiliary losses (objectness, quality)
+        local_weight: Weight for local supervision loss
     """
     model.train()
-    total_losses = {'seg_loss': 0, 'det_loss': 0, 'obj_loss': 0, 'qual_loss': 0, 'total': 0}
+    total_losses = {'seg_loss': 0, 'det_loss': 0, 'local_loss': 0, 'obj_loss': 0, 'qual_loss': 0, 'total': 0}
+    total_metrics = {'giou': 0, 'iou': 0}
     num_samples = 0
 
     # Detection loss warmup: ramp up from 0 to det_weight over warmup_epochs
@@ -377,14 +405,16 @@ def train_one_epoch(model, loader, optimizer, device, scaler,
             seg_logits, boxes_local, objectness, quality = model(
                 patches, patch_pos=positions, volume_shape=volume_shape)
 
-            losses, _ = compute_losses(
+            losses, metrics = compute_losses(
                 seg_logits, boxes_local, objectness, quality,
                 seg_patches, positions, gt_box, has_gt_box, volume_shape,
-                dice_loss_fn, ce_loss_fn, device)
+                dice_loss_fn, ce_loss_fn, device,
+                use_local_supervision=True, local_weight=local_weight)
 
             # Compute total loss with warmup
             total_loss = losses['seg_loss']
             total_loss = total_loss + det_scale * det_weight * losses['det_loss']
+            total_loss = total_loss + det_scale * local_weight * losses['local_loss']
             total_loss = total_loss + det_scale * aux_weight * (losses['obj_loss'] + losses['qual_loss'])
             losses['total'] = total_loss
 
@@ -419,13 +449,18 @@ def train_one_epoch(model, loader, optimizer, device, scaler,
 
         for k in total_losses:
             total_losses[k] += losses[k].item()
+        for k in total_metrics:
+            total_metrics[k] += metrics[k]
         num_samples += 1
 
-    return {k: v / max(num_samples, 1) for k, v in total_losses.items()}
+    avg_losses = {k: v / max(num_samples, 1) for k, v in total_losses.items()}
+    avg_metrics = {k: v / max(num_samples, 1) for k, v in total_metrics.items()}
+
+    return {**avg_losses, **avg_metrics}
 
 
 # ---------------------------------------------------------------------------
-# Validation with sliding window
+# Validation with sliding window - Uses CORNER format
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -468,30 +503,45 @@ def validate(model, loader, device):
 
         # Detection metrics (if GT box exists)
         if has_gt_box:
+            # Transform to global CORNER format
             boxes_global = transform_box_to_global(
                 boxes_local, positions, PATCH_SIZE, volume_shape.tolist())
-            fused_box, _ = fuse_patch_boxes(boxes_global, objectness, quality)
 
-            # Convert GT to center format
-            gt_cz = (gt_box[0] + gt_box[3]) / 2
-            gt_cy = (gt_box[1] + gt_box[4]) / 2
-            gt_cx = (gt_box[2] + gt_box[5]) / 2
-            gt_dz = gt_box[3] - gt_box[0]
-            gt_dy = gt_box[4] - gt_box[1]
-            gt_dx = gt_box[5] - gt_box[2]
-            gt_box_center = torch.stack([gt_cz, gt_cy, gt_cx, gt_dz, gt_dy, gt_dx])
+            # Only use overlapping patches for fusion
+            gt_box_np = gt_box.cpu().numpy()
+            has_overlap = []
+            for i in range(boxes_local.shape[0]):
+                pos = positions[i].cpu().numpy().astype(int)
+                obj_gt, _, _ = compute_patch_targets(pos, PATCH_SIZE, gt_box_np)
+                has_overlap.append(obj_gt > 0.5)
+
+            has_overlap = torch.tensor(has_overlap, device=device)
+
+            if has_overlap.sum() > 0:
+                overlap_indices = has_overlap.nonzero(as_tuple=True)[0]
+                boxes_overlap = boxes_global[overlap_indices]
+                obj_overlap = objectness[overlap_indices]
+                qual_overlap = quality[overlap_indices]
+                fused_box, _ = fuse_patch_boxes(boxes_overlap, obj_overlap, qual_overlap)
+            else:
+                fused_box, _ = fuse_patch_boxes(boxes_global, objectness, quality)
+
+            # Both fused_box and gt_box are in CORNER format
+            gt_box_f32 = gt_box.float()
+            fused_box_f32 = fused_box.float()
 
             # Check for valid boxes before computing GIoU
-            if gt_dz > 0 and gt_dy > 0 and gt_dx > 0:
-                giou = compute_giou_3d(fused_box, gt_box_center)
+            if (gt_box[3] > gt_box[0]) and (gt_box[4] > gt_box[1]) and (gt_box[5] > gt_box[2]):
+                giou = compute_giou_3d_corners(fused_box_f32, gt_box_f32)
+                iou = compute_iou_3d_corners(fused_box_f32, gt_box_f32)
+
                 giou_val = giou.item()
+                iou_val = iou.item()
 
                 # Skip NaN values
-                if not np.isnan(giou_val):
+                if not np.isnan(giou_val) and not np.isnan(iou_val):
                     giou_list.append(giou_val)
-                    # IoU approximation from GIoU
-                    iou = (giou_val + 1) / 2
-                    iou_list.append(max(0, min(1, iou)))
+                    iou_list.append(iou_val)
 
     return {
         'dice': np.mean(dice_list) if dice_list else 0.0,
@@ -542,6 +592,8 @@ if __name__ == "__main__":
                         help="Detection loss weight after warmup")
     parser.add_argument("--aux_weight", type=float, default=0.5,
                         help="Auxiliary loss weight (objectness + quality)")
+    parser.add_argument("--local_weight", type=float, default=0.5,
+                        help="Local supervision loss weight")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -611,23 +663,25 @@ if __name__ == "__main__":
     print(f"Detection loss warmup: {args.warmup_epochs} epochs")
 
     for epoch in range(args.max_epoch):
-        losses = train_one_epoch(
+        results = train_one_epoch(
             model, train_loader, optimizer, device, scaler,
             dice_loss_fn, ce_loss_fn,
             epoch=epoch, warmup_epochs=args.warmup_epochs,
-            det_weight=args.det_weight, aux_weight=args.aux_weight)
+            det_weight=args.det_weight, aux_weight=args.aux_weight,
+            local_weight=args.local_weight)
         scheduler.step(epoch)
 
         lr_now = optimizer.param_groups[0]['lr']
 
-        for k, v in losses.items():
+        for k, v in results.items():
             writer.add_scalar(f"train/{k}", v, epoch)
         writer.add_scalar("train/lr", lr_now, epoch)
 
         # Show warmup status
         det_scale = min(1.0, epoch / args.warmup_epochs) if args.warmup_epochs > 0 else 1.0
-        print(f"  [epoch {epoch:3d}]  total={losses['total']:.4f}  "
-              f"seg={losses['seg_loss']:.4f}  det={losses['det_loss']:.4f}  "
+        print(f"  [epoch {epoch:3d}]  total={results['total']:.4f}  "
+              f"seg={results['seg_loss']:.4f}  det={results['det_loss']:.4f}  "
+              f"local={results['local_loss']:.4f}  GIoU={results['giou']:.4f}  "
               f"det_scale={det_scale:.2f}  lr={lr_now:.6f}")
 
         if (epoch + 1) % args.val_every == 0:
