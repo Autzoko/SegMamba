@@ -37,11 +37,12 @@ from model_segmamba.segmamba_retina import (
 )
 from detection.atss_matcher import ATSSMatcher
 from detection.sampler import HardNegativeSampler
-from detection.losses import focal_loss, smooth_l1_loss, giou_loss_3d
+from detection.losses import focal_loss, smooth_l1_loss, giou_loss_3d, nms_3d
 from detection.box_coder import BoxCoder3D
 from detection.retina_head import reshape_head_outputs
 
 from light_training.utils.lr_scheduler import PolyLRScheduler
+from scipy import ndimage
 
 
 PATCH_SIZE = (128, 128, 128)
@@ -694,6 +695,248 @@ def validate(
     }
 
 
+# ==============================================================================
+# Full-Volume Validation (Sliding Window)
+# ==============================================================================
+
+class ABUSFullVolumeDataset(Dataset):
+    """Dataset that returns full volumes for validation."""
+
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+        self.files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+        if len(self.files) == 0:
+            raise ValueError(f"No .npz files found in {data_dir}")
+        print(f"Found {len(self.files)} validation volumes in {data_dir}")
+
+    def __len__(self):
+        return len(self.files)
+
+    def _get_boxes_from_mask(self, mask: np.ndarray) -> list:
+        """Extract bounding boxes from segmentation mask."""
+        labeled, num_features = ndimage.label(mask > 0)
+        boxes = []
+        for i in range(1, num_features + 1):
+            coords = np.where(labeled == i)
+            if len(coords[0]) == 0:
+                continue
+            z1, z2 = coords[0].min(), coords[0].max() + 1
+            y1, y2 = coords[1].min(), coords[1].max() + 1
+            x1, x2 = coords[2].min(), coords[2].max() + 1
+            # Box format: [x1, y1, x2, y2, z1, z2]
+            boxes.append([x1, y1, x2, y2, z1, z2])
+        return boxes
+
+    def __getitem__(self, idx):
+        npz_path = self.files[idx]
+        data = np.load(npz_path)
+        volume = data['data'].astype(np.float32)  # (1, D, H, W)
+        mask = data['seg'].astype(np.float32)
+
+        if mask.ndim == 4:
+            mask = mask[0]
+        mask = (mask > 0).astype(np.int64)
+
+        gt_boxes = self._get_boxes_from_mask(mask)
+
+        return {
+            'volume': torch.from_numpy(volume),
+            'mask': torch.from_numpy(mask),
+            'gt_boxes': gt_boxes,
+            'name': os.path.basename(npz_path).replace('.npz', ''),
+        }
+
+
+def sliding_window_positions(volume_shape, patch_size, overlap=0.5):
+    """Generate sliding window positions."""
+    positions = []
+    stride = [int(p * (1 - overlap)) for p in patch_size]
+
+    for z in range(0, max(1, volume_shape[0] - patch_size[0] + 1), stride[0]):
+        for y in range(0, max(1, volume_shape[1] - patch_size[1] + 1), stride[1]):
+            for x in range(0, max(1, volume_shape[2] - patch_size[2] + 1), stride[2]):
+                positions.append((z, y, x))
+
+    if len(positions) == 0:
+        positions.append((0, 0, 0))
+
+    # Add corners
+    z_max = max(0, volume_shape[0] - patch_size[0])
+    y_max = max(0, volume_shape[1] - patch_size[1])
+    x_max = max(0, volume_shape[2] - patch_size[2])
+
+    for pos in [(0,0,0), (0,0,x_max), (0,y_max,0), (0,y_max,x_max),
+                (z_max,0,0), (z_max,0,x_max), (z_max,y_max,0), (z_max,y_max,x_max)]:
+        if pos not in positions and all(p >= 0 for p in pos):
+            positions.append(pos)
+
+    return positions
+
+
+def extract_patch_np(volume, position, patch_size):
+    """Extract and pad patch from numpy volume."""
+    z, y, x = position
+    patch = volume[:, z:z+patch_size[0], y:y+patch_size[1], x:x+patch_size[2]]
+
+    if patch.shape[1:] != tuple(patch_size):
+        pad_d = patch_size[0] - patch.shape[1]
+        pad_h = patch_size[1] - patch.shape[2]
+        pad_w = patch_size[2] - patch.shape[3]
+        patch = np.pad(patch, ((0,0), (0,pad_d), (0,pad_h), (0,pad_w)), mode='constant')
+
+    return patch
+
+
+def validate_full_volume(
+    model: SegMambaWithRetina,
+    val_dataset: ABUSFullVolumeDataset,
+    box_coder: BoxCoder3D,
+    device: torch.device,
+    overlap: float = 0.5,
+    score_threshold: float = 0.05,
+    nms_threshold: float = 0.5,
+):
+    """
+    Validate on full volumes with sliding window inference.
+
+    Returns segmentation Dice and detection metrics (recall, precision, AP).
+    """
+    model.eval()
+
+    all_dices = []
+    total_tp = {0.1: 0, 0.25: 0, 0.5: 0}
+    total_fp = {0.1: 0, 0.25: 0, 0.5: 0}
+    total_gt = 0
+    num_samples_with_gt = 0
+
+    with torch.no_grad():
+        for idx in tqdm(range(len(val_dataset)), desc="Validating (full-vol)"):
+            sample = val_dataset[idx]
+            volume = sample['volume'].numpy()  # (1, D, H, W)
+            mask = sample['mask'].numpy()  # (D, H, W)
+            gt_boxes = sample['gt_boxes']
+
+            volume_shape = volume.shape[1:]
+            positions = sliding_window_positions(volume_shape, PATCH_SIZE, overlap)
+
+            # Accumulators for segmentation
+            seg_sum = np.zeros((2, *volume_shape), dtype=np.float32)
+            weight_sum = np.zeros(volume_shape, dtype=np.float32)
+
+            # Gaussian weight for blending
+            sigma = [s / 4 for s in PATCH_SIZE]
+            zz, yy, xx = np.mgrid[:PATCH_SIZE[0], :PATCH_SIZE[1], :PATCH_SIZE[2]]
+            center = [s / 2 for s in PATCH_SIZE]
+            gaussian = np.exp(-((zz-center[0])**2/(2*sigma[0]**2) +
+                                (yy-center[1])**2/(2*sigma[1]**2) +
+                                (xx-center[2])**2/(2*sigma[2]**2))).astype(np.float32)
+
+            # Detection accumulators
+            all_boxes = []
+            all_scores = []
+
+            # Process patches
+            for pos in positions:
+                patch = extract_patch_np(volume, pos, PATCH_SIZE)
+                patch_tensor = torch.from_numpy(patch).unsqueeze(0).to(device)
+
+                with autocast():
+                    outputs = model(patch_tensor, return_seg=True, return_det=True)
+
+                # Segmentation
+                seg_probs = torch.softmax(outputs['seg_logits'], dim=1)[0].cpu().numpy()
+
+                z, y, x = pos
+                d_end = min(z + PATCH_SIZE[0], volume_shape[0]) - z
+                h_end = min(y + PATCH_SIZE[1], volume_shape[1]) - y
+                w_end = min(x + PATCH_SIZE[2], volume_shape[2]) - x
+
+                seg_sum[:, z:z+d_end, y:y+h_end, x:x+w_end] += (
+                    seg_probs[:, :d_end, :h_end, :w_end] * gaussian[:d_end, :h_end, :w_end])
+                weight_sum[z:z+d_end, y:y+h_end, x:x+w_end] += gaussian[:d_end, :h_end, :w_end]
+
+                # Detection
+                cls_flat, box_flat, ctr_flat, _ = reshape_head_outputs(
+                    outputs['cls_logits'], outputs['box_deltas'], outputs['centerness'],
+                    model.num_anchors, model.num_classes)
+                anchors = outputs['anchors']
+
+                cls_scores = torch.sigmoid(cls_flat[0].view(-1))
+                ctr_scores = torch.sigmoid(ctr_flat[0].view(-1))
+                scores = cls_scores * ctr_scores
+
+                keep = scores > score_threshold
+                if keep.sum() > 0:
+                    kept_scores = scores[keep]
+                    kept_deltas = box_flat[0][keep]
+                    kept_anchors = anchors[keep]
+
+                    boxes_local = box_coder.decode(kept_deltas, kept_anchors)
+                    # Transform to global: add patch offset
+                    # Box format: [x1, y1, x2, y2, z1, z2]
+                    offset = torch.tensor([x, y, x, y, z, z], device=device, dtype=boxes_local.dtype)
+                    boxes_global = boxes_local + offset
+
+                    all_boxes.append(boxes_global.cpu())
+                    all_scores.append(kept_scores.cpu())
+
+            # Finalize segmentation
+            weight_sum = np.maximum(weight_sum, 1e-6)
+            seg_probs_full = seg_sum / weight_sum
+            seg_pred = (seg_probs_full[1] > 0.5).astype(np.int64)
+
+            # Compute Dice
+            intersection = ((seg_pred == 1) & (mask == 1)).sum()
+            union = (seg_pred == 1).sum() + (mask == 1).sum()
+            dice = 2 * intersection / (union + 1e-6)
+            all_dices.append(dice)
+
+            # Finalize detection with NMS
+            if len(all_boxes) > 0:
+                all_boxes = torch.cat(all_boxes, dim=0)
+                all_scores = torch.cat(all_scores, dim=0)
+
+                # Clip to volume
+                all_boxes[:, 0] = all_boxes[:, 0].clamp(0, volume_shape[2])
+                all_boxes[:, 1] = all_boxes[:, 1].clamp(0, volume_shape[1])
+                all_boxes[:, 2] = all_boxes[:, 2].clamp(0, volume_shape[2])
+                all_boxes[:, 3] = all_boxes[:, 3].clamp(0, volume_shape[1])
+                all_boxes[:, 4] = all_boxes[:, 4].clamp(0, volume_shape[0])
+                all_boxes[:, 5] = all_boxes[:, 5].clamp(0, volume_shape[0])
+
+                keep_nms = nms_3d(all_boxes, all_scores, nms_threshold)
+                pred_boxes = all_boxes[keep_nms].numpy().tolist()
+                pred_scores = all_scores[keep_nms].numpy().tolist()
+            else:
+                pred_boxes = []
+                pred_scores = []
+
+            # Detection metrics
+            if len(gt_boxes) > 0:
+                total_gt += len(gt_boxes)
+                num_samples_with_gt += 1
+
+            for iou_thresh in [0.1, 0.25, 0.5]:
+                _, _, tp, fp, _ = compute_ap_recall(pred_boxes, pred_scores, gt_boxes, iou_thresh)
+                total_tp[iou_thresh] += tp
+                total_fp[iou_thresh] += fp
+
+    # Compute final metrics
+    mean_dice = np.mean(all_dices) if all_dices else 0.0
+
+    det_metrics = {}
+    for iou_thresh in [0.1, 0.25, 0.5]:
+        recall = total_tp[iou_thresh] / max(total_gt, 1)
+        precision = total_tp[iou_thresh] / max(total_tp[iou_thresh] + total_fp[iou_thresh], 1)
+        det_metrics[f'recall@{iou_thresh}'] = recall
+        det_metrics[f'precision@{iou_thresh}'] = precision
+
+    return {
+        'dice': mean_dice,
+        **det_metrics,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train SegMamba-Retina")
 
@@ -750,10 +993,8 @@ def main():
         args.data_dir_train,
         fg_ratio=args.fg_ratio,
     )
-    val_dataset = ABUSRetinaDataset(
-        args.data_dir_val,
-        fg_ratio=0.5,  # Same as training to get meaningful detection metrics
-    )
+    # Full-volume dataset for validation (sliding window inference)
+    val_dataset = ABUSFullVolumeDataset(args.data_dir_val)
 
     train_loader = DataLoader(
         train_dataset,
@@ -763,13 +1004,7 @@ def main():
         pin_memory=True,
         drop_last=True,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
+    # Note: val_dataset is used directly, not through DataLoader
 
     # Create model
     model = SegMambaWithRetina(
@@ -832,9 +1067,11 @@ def main():
 
         scheduler.step()
 
-        # Validation (debug=True for first epoch only)
-        val_metrics = validate(model, val_loader, dice_loss_fn, box_coder, device,
-                               debug=(epoch == 1))
+        # Full-volume validation with sliding window
+        val_metrics = validate_full_volume(
+            model, val_dataset, box_coder, device,
+            overlap=0.5, score_threshold=0.05, nms_threshold=0.5
+        )
 
         print(f"\nEpoch {epoch}/{args.max_epoch}")
         print(f"  Train: loss={train_metrics['loss']:.4f}, "
@@ -843,14 +1080,11 @@ def main():
               f"reg={train_metrics['reg_loss']:.4f}, "
               f"dice={train_metrics['dice']:.4f}, "
               f"avg_pos={train_metrics['avg_pos']:.1f}")
-        print(f"  Val: seg_loss={val_metrics['seg_loss']:.4f}, "
-              f"dice={val_metrics['dice']:.4f}")
+        print(f"  Val: dice={val_metrics['dice']:.4f} (full-volume)")
         print(f"  Det: recall@0.25={val_metrics['recall@0.25']:.4f}, "
-              f"precision@0.25={val_metrics['precision@0.25']:.4f}, "
-              f"AP@0.25={val_metrics['ap@0.25']:.4f}")
+              f"precision@0.25={val_metrics['precision@0.25']:.4f}")
         print(f"       recall@0.5={val_metrics['recall@0.5']:.4f}, "
-              f"precision@0.5={val_metrics['precision@0.5']:.4f}, "
-              f"AP@0.5={val_metrics['ap@0.5']:.4f}")
+              f"precision@0.5={val_metrics['precision@0.5']:.4f}")
 
         # Save best model (based on Dice)
         if val_metrics['dice'] > best_dice:
