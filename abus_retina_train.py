@@ -573,12 +573,14 @@ def validate(
     box_coder: BoxCoder3D,
     device: torch.device,
     score_threshold: float = 0.3,
+    debug: bool = False,
 ):
     """Validate the model with both segmentation and detection metrics."""
     model.eval()
 
     total_dice = 0.0
     total_seg_loss = 0.0
+    debug_printed = False
 
     # Detection metrics accumulators
     total_tp = {0.1: 0, 0.25: 0, 0.5: 0}
@@ -607,6 +609,16 @@ def validate(
                 intersection = ((pred == 1) & (masks == 1)).sum()
                 union = (pred == 1).sum() + (masks == 1).sum()
                 dice = 2 * intersection / (union + 1e-6)
+
+            # Debug: print first batch statistics
+            if debug and not debug_printed:
+                print(f"\n  DEBUG Validation:")
+                print(f"    Input: shape={images.shape}, min={images.min():.3f}, max={images.max():.3f}")
+                print(f"    Mask: shape={masks.shape}, unique={torch.unique(masks).tolist()}, sum={masks.sum().item()}")
+                print(f"    Logits: shape={seg_logits.shape}, ch0 mean={seg_logits[:,0].mean():.3f}, ch1 mean={seg_logits[:,1].mean():.3f}")
+                print(f"    Pred==1: {(pred == 1).sum().item()}, GT==1: {(masks == 1).sum().item()}")
+                print(f"    Intersection: {intersection.item()}, Dice: {dice.item():.4f}")
+                debug_printed = True
 
             total_seg_loss += seg_loss.item()
             total_dice += dice.item()
@@ -820,8 +832,9 @@ def main():
 
         scheduler.step()
 
-        # Validation
-        val_metrics = validate(model, val_loader, dice_loss_fn, box_coder, device)
+        # Validation (debug=True for first epoch only)
+        val_metrics = validate(model, val_loader, dice_loss_fn, box_coder, device,
+                               debug=(epoch == 1))
 
         print(f"\nEpoch {epoch}/{args.max_epoch}")
         print(f"  Train: loss={train_metrics['loss']:.4f}, "
