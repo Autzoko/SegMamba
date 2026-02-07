@@ -248,7 +248,9 @@ class ABUSRetinaDataset(Dataset):
 
         # Convert to tensors
         patch_vol = torch.from_numpy(patch_vol)
-        patch_mask = torch.from_numpy(patch_mask).long()
+        # Ensure mask is binary (0 or 1) before converting to long
+        patch_mask = (patch_mask > 0).astype(np.int64)
+        patch_mask = torch.from_numpy(patch_mask)
 
         # Pack boxes as tensor (pad to fixed size)
         max_boxes = 10
