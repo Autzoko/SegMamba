@@ -354,8 +354,11 @@ def load_pretrained_segmamba(
         for k, v in state_dict.items()
     }
 
+    print(f"Checkpoint keys (first 10): {list(state_dict.keys())[:10]}")
+
     # Map 'out' to 'seg_out' if needed
     if 'out.conv.conv.weight' in state_dict and 'seg_out.conv.conv.weight' not in state_dict:
+        print("  Mapping 'out.*' -> 'seg_out.*'")
         new_state_dict = {}
         for k, v in state_dict.items():
             if k.startswith('out.'):
@@ -371,6 +374,23 @@ def load_pretrained_segmamba(
     print(f"Loaded pretrained SegMamba from {checkpoint_path}")
     print(f"  Missing keys (detection components): {len(missing)}")
     print(f"  Unexpected keys: {len(unexpected)}")
+
+    # Show which keys are missing - should only be detection-related
+    det_keys = [k for k in missing if any(x in k for x in ['fpn', 'retina_head', 'anchor'])]
+    seg_keys = [k for k in missing if not any(x in k for x in ['fpn', 'retina_head', 'anchor'])]
+
+    if seg_keys:
+        print(f"  WARNING: Missing segmentation keys: {seg_keys[:5]}...")
+
+    # Verify a key weight was loaded correctly
+    if 'vit.downsample_layers.0.0.weight' in state_dict:
+        ckpt_val = state_dict['vit.downsample_layers.0.0.weight'].mean().item()
+        model_val = model.vit.downsample_layers[0][0].weight.mean().item()
+        print(f"  Verification - vit.downsample_layers.0.0.weight mean: ckpt={ckpt_val:.6f}, model={model_val:.6f}")
+        if abs(ckpt_val - model_val) > 1e-6:
+            print("  ERROR: Weights were NOT loaded correctly!")
+        else:
+            print("  SUCCESS: Weights loaded correctly!")
 
     return model
 
