@@ -121,138 +121,255 @@ python 5_compute_metrics.py --pred_name="segmamba"
 
 ---
 
-## ABUS Tumor Detection & Segmentation
+## ABUS Tumor Detection & Segmentation (SegMamba-Retina)
 
-This repository has been extended to support **Automated Breast Ultrasound (ABUS)** tumor detection and segmentation with multiple detection pipelines.
+This section describes the complete workflow for **Automated Breast Ultrasound (ABUS)** tumor detection and segmentation using the **SegMamba-Retina** pipeline.
+
+### Quick Start (Complete Pipeline)
+
+```bash
+# Step 1: Preprocess ABUS data (80/10/10 split, only cases with lesions)
+python abus_preprocessing.py --abus_root /path/to/ABUS --seed 42
+
+# Step 2: Train segmentation model
+python abus_train.py --max_epoch 1000
+
+# Step 3: Train detection (with frozen backbone to preserve segmentation)
+python abus_retina_train.py \
+    --pretrained_seg ./logs/segmamba_abus/model/best_model.pt \
+    --freeze_backbone \
+    --full_volume_val \
+    --max_epoch 500
+
+# Step 4: Run inference
+python abus_retina_predict.py \
+    --model_path ./logs/segmamba_abus_retina/model/best_model.pt \
+    --save_seg
+
+# Step 5: Evaluate
+python abus_compute_metrics.py --pred_name segmamba_abus_retina  # Segmentation
+python abus_det_compute_metrics.py --pred_file ./prediction_results/segmamba_abus_retina/detections.json  # Detection
+```
+
+---
 
 ### ABUS Dataset Setup
 
 The ABUS dataset should be organized as:
 ```
-/path/to/ABUS/
-├── Train/          # 100 cases
-├── Validation/     # 30 cases
-├── Test/           # 70 cases
-└── abus_labels.csv # Contains case_id, diagnosis (M/B)
+/path/to/ABUS/data/
+├── Train/
+│   ├── DATA/DATA_XXX.nrrd
+│   └── MASK/MASK_XXX.nrrd
+├── Validation/
+│   ├── DATA/...
+│   └── MASK/...
+└── Test/
+    ├── DATA/...
+    └── MASK/...
 ```
 
-### Preprocessing
+---
+
+### Step 1: Preprocessing
+
+The preprocessing script:
+- Collects ALL cases from Train/Validation/Test folders
+- **Filters out cases without lesions** (empty masks)
+- Splits data **80% train / 10% val / 10% test** with random seed
+- Applies Z-score normalization and crops to non-zero region
 
 ```bash
-# Preprocess ABUS data (NRRD → NPZ with normalization and cropping)
-python abus_preprocessing.py --abus_root /path/to/ABUS --output_dir ./data/abus
+python abus_preprocessing.py \
+    --abus_root /path/to/ABUS \
+    --output_base ./data/abus \
+    --seed 42 \
+    --num_processes 4
 ```
 
-### Segmentation Training & Inference
-
-```bash
-# Train segmentation model
-python abus_train.py --max_epoch 1000
-
-# Run inference
-python abus_predict.py --model_path ./logs/segmamba_abus/model/best_model.pt
-
-# Compute metrics (Dice, HD95)
-python abus_compute_metrics.py --pred_name segmamba_abus
+**Output:**
+```
+./data/abus/
+├── train/          # 80% of cases with lesions
+├── val/            # 10% of cases with lesions
+├── test/           # 10% of cases with lesions
+├── split_info.pkl  # Split details for reproducibility
+└── split_info.txt  # Human-readable split info
 ```
 
-### Detection Pipelines
+**Arguments:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--abus_root` | `/Volumes/Autzoko/ABUS` | Path to raw ABUS dataset |
+| `--output_base` | `./data/abus` | Output directory |
+| `--seed` | `42` | Random seed for split |
+| `--train_ratio` | `0.8` | Training set ratio |
+| `--val_ratio` | `0.1` | Validation set ratio |
+| `--num_processes` | `4` | Parallel workers |
 
-Multiple detection approaches are available:
+---
 
-#### Pipeline A: Segmentation → Box Extraction
-Extract bounding boxes from predicted segmentation masks:
+### Step 2: Train Segmentation Model
+
+Train the base SegMamba model for tumor segmentation:
+
 ```bash
-python abus_seg_to_boxes.py --pred_dir ./prediction_results/segmamba_abus
-python abus_seg_box_eval.py  # Evaluate seg-derived boxes vs GT
+python abus_train.py \
+    --data_dir_train ./data/abus/train \
+    --data_dir_val ./data/abus/val \
+    --max_epoch 1000 \
+    --batch_size 2
 ```
 
-#### Pipeline B: FCOS-style Detection (SegMamba-Det)
-Per-voxel anchor-free detection with FPN:
-```bash
-python abus_det_train.py --max_epoch 500
-python abus_det_predict.py --model_path ./logs/segmamba_det/model/best_model.pt
-python abus_det_compute_metrics.py --pred_file ./prediction_results/.../detections.json
-```
+**Output:** `./logs/segmamba_abus/model/best_model.pt`
 
-#### Pipeline C: DETR-style Detection (SegMamba-DETR)
-Transformer decoder with set prediction:
-```bash
-python abus_detr_train.py --max_epoch 500
-python abus_detr_predict.py --model_path ./logs/segmamba_detr/model/best_model.pt
-```
+---
 
-#### Pipeline D: BoxHead Detection
-Attention-based single box prediction per volume:
-```bash
-python abus_boxhead_train.py --pretrained_seg ./logs/segmamba_abus/model/best_model.pt
-python abus_boxhead_predict.py --model_path ./logs/segmamba_boxhead/model/best_model.pt
-```
+### Step 3: Train SegMamba-Retina (Detection)
 
-#### Pipeline E: Patch Fusion Detection
-Full-resolution patch-based training with global box fusion:
-```bash
-python abus_patch_fusion_train.py --pretrained_seg ./logs/segmamba_abus/model/best_model.pt
-python abus_patch_fusion_predict.py --model_path ./logs/segmamba_patch_fusion/model/best_model.pt
-```
+Train the detection head with pretrained segmentation weights:
 
-#### Pipeline F: SegMamba-Retina (nnDetection-style) ⭐ **NEW**
-Anchor-based 3D RetinaNet with FPN, ATSS matching, and focal loss:
 ```bash
-# Train with pretrained segmentation weights (joint training)
-python abus_retina_train.py \
-    --pretrained_seg ./logs/segmamba_abus/model/best_model.pt \
-    --max_epoch 500 \
-    --fg_ratio 0.5
-
-# Train detection only (freeze backbone, preserve seg quality)
+# Option A: Freeze backbone (recommended - preserves segmentation quality)
 python abus_retina_train.py \
     --pretrained_seg ./logs/segmamba_abus/model/best_model.pt \
     --freeze_backbone \
-    --max_epoch 500
+    --full_volume_val \
+    --max_epoch 500 \
+    --fg_ratio 0.5
 
-# Inference with sliding window + NMS
-python abus_retina_predict.py \
-    --model_path ./logs/segmamba_abus_retina/model/best_model.pt \
-    --save_seg
-
-# Evaluate detection
-python abus_det_compute_metrics.py \
-    --pred_file ./prediction_results/segmamba_abus_retina/detections.json
+# Option B: Joint training (fine-tunes both seg and det)
+python abus_retina_train.py \
+    --pretrained_seg ./logs/segmamba_abus/model/best_model.pt \
+    --full_volume_val \
+    --max_epoch 500 \
+    --fg_ratio 0.5
 ```
 
-**SegMamba-Retina Architecture:**
+**Key Arguments:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--pretrained_seg` | `""` | Path to pretrained SegMamba checkpoint |
+| `--freeze_backbone` | `False` | Freeze backbone, only train detection head |
+| `--full_volume_val` | `False` | Use full-volume validation (slower but accurate) |
+| `--fg_ratio` | `0.5` | Fraction of patches containing tumors |
+| `--det_warmup_epochs` | `50` | Epochs to ramp up detection loss |
+| `--max_epoch` | `500` | Total training epochs |
+
+**Output:** `./logs/segmamba_abus_retina/model/best_model.pt`
+
+---
+
+### Step 4: Inference
+
+Run sliding window inference with NMS:
+
+```bash
+python abus_retina_predict.py \
+    --model_path ./logs/segmamba_abus_retina/model/best_model.pt \
+    --data_dir_test ./data/abus/test \
+    --save_seg \
+    --overlap 0.5
+```
+
+**Arguments:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--model_path` | Required | Path to trained model |
+| `--data_dir_test` | `./data/abus/test` | Test data directory |
+| `--save_seg` | `False` | Save segmentation masks as NIfTI |
+| `--overlap` | `0.5` | Sliding window overlap |
+| `--score_threshold` | `0.05` | Detection score threshold |
+| `--nms_threshold` | `0.5` | NMS IoU threshold |
+
+**Output:**
+```
+./prediction_results/segmamba_abus_retina/
+├── detections.json     # Detection boxes + scores
+└── ABUS_XXX.nii.gz     # Segmentation masks (if --save_seg)
+```
+
+---
+
+### Step 5: Evaluation
+
+**Segmentation Metrics (Dice, HD95):**
+```bash
+python abus_compute_metrics.py --pred_name segmamba_abus_retina
+```
+
+**Detection Metrics (AP, Recall, Precision):**
+```bash
+python abus_det_compute_metrics.py \
+    --pred_file ./prediction_results/segmamba_abus_retina/detections.json \
+    --abus_root /path/to/ABUS
+```
+
+---
+
+### SegMamba-Retina Architecture
+
 ```
 Input (B, 1, 128, 128, 128)
     │
     ▼
-MambaEncoder (shared backbone)
+┌───────────────────────────────────┐
+│ MambaEncoder (shared backbone)    │
+│   outs[0]: (B, 48, 64, 64, 64)    │
+│   outs[1]: (B, 96, 32, 32, 32)    │  ← P4 (stride 4)
+│   outs[2]: (B, 192, 16, 16, 16)   │  ← P8 (stride 8)
+│   outs[3]: (B, 384, 8, 8, 8)      │  ← P16 (stride 16)
+└───────────────────────────────────┘
     │
-    ├── Segmentation Decoder → Dice+CE loss
-    │
-    └── Detection Pathway
-        ├── FPN3D (strides 4/8/16/32)
-        └── Retina3DHead → Focal + L1 + GIoU loss
+    ├─────────────────────────────────────────┐
+    ▼                                         ▼
+┌─────────────────────┐            ┌─────────────────────┐
+│ Segmentation Decoder│            │ Detection Pathway   │
+│ (UNETR-style)       │            │                     │
+│                     │            │ FPN3D (128 channels)│
+│ → Dice + CE loss    │            │ Retina3DHead        │
+└─────────────────────┘            │                     │
+                                   │ → Focal + L1 + GIoU │
+                                   └─────────────────────┘
 ```
 
-Key features:
-- Multi-scale anchor generation with ATSS matching
+**Key Features:**
+- Multi-scale anchor generation (strides 4/8/16/32)
+- ATSS (Adaptive Training Sample Selection) matching
 - Hard negative mining for class imbalance
 - Biased patch sampling (50% foreground)
-- Detection loss warmup
-- Sliding window inference with global NMS
-- `--freeze_backbone` option to train detection only while preserving segmentation
+- Detection loss warmup (50 epochs)
+- `--freeze_backbone` to train detection only
+
+---
 
 ### Detection Module
 
 The `detection/` directory contains reusable 3D detection components:
-- `anchors.py` - Multi-scale 3D anchor generation
-- `fpn.py` - 3D Feature Pyramid Network
-- `retina_head.py` - RetinaNet-style detection head
-- `atss_matcher.py` - Adaptive Training Sample Selection
-- `sampler.py` - Hard negative mining
-- `losses.py` - Focal loss, GIoU loss, 3D NMS
-- `box_coder.py` - Box encoding/decoding
+
+| File | Description |
+|------|-------------|
+| `anchors.py` | Multi-scale 3D anchor generation |
+| `fpn.py` | 3D Feature Pyramid Network |
+| `retina_head.py` | RetinaNet-style cls/reg heads |
+| `atss_matcher.py` | Adaptive Training Sample Selection |
+| `sampler.py` | Hard negative mining |
+| `losses.py` | Focal loss, GIoU loss, 3D NMS |
+| `box_coder.py` | Box encoding/decoding |
+
+---
+
+### Other Detection Pipelines (Legacy)
+
+Additional detection approaches are available but SegMamba-Retina is recommended:
+
+| Pipeline | Script | Description |
+|----------|--------|-------------|
+| A: Seg→Box | `abus_seg_box_eval.py` | Extract boxes from segmentation masks |
+| B: FCOS | `abus_det_train.py` | Anchor-free per-voxel detection |
+| C: DETR | `abus_detr_train.py` | Transformer decoder with set prediction |
+| D: BoxHead | `abus_boxhead_train.py` | Attention-based single box prediction |
+| E: PatchFusion | `abus_patch_fusion_train.py` | Patch-based with global fusion |
 
 ---
 

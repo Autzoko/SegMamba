@@ -4,23 +4,29 @@ ABUS 3D Ultrasound Dataset Preprocessing for SegMamba.
 Converts NRRD format ABUS data into SegMamba's NPZ + PKL format.
 Handles: single-channel 3D ultrasound, binary segmentation masks.
 
+Key features:
+- Collects ALL cases from Train/Validation/Test folders
+- Filters out cases with NO lesion (empty mask)
+- Splits data 80/10/10 (train/val/test) with random seed
+- Z-score normalization, crop to nonzero
+
 Pipeline per case:
-    Load NRRD -> float32 -> Crop to nonzero -> Z-score normalize
-    -> Compute class locations -> Save NPZ + PKL
+    Load NRRD -> Verify lesion exists -> float32 -> Crop to nonzero
+    -> Z-score normalize -> Compute class locations -> Save NPZ + PKL
 
 Usage:
-    python abus_preprocessing.py
+    python abus_preprocessing.py --abus_root /path/to/ABUS --seed 42
 
 Data layout expected:
-    /Volumes/Autzoko/ABUS/data/
+    /path/to/ABUS/data/
         Train/DATA/DATA_XXX.nrrd   Train/MASK/MASK_XXX.nrrd
         Validation/DATA/...        Validation/MASK/...
         Test/DATA/...              Test/MASK/...
 
 Output layout:
-    ./data/abus/train/ABUS_XXX.npz  + .pkl
-    ./data/abus/val/ABUS_XXX.npz    + .pkl
-    ./data/abus/test/ABUS_XXX.npz   + .pkl
+    ./data/abus/train/ABUS_XXX.npz  + .pkl  (80% of data)
+    ./data/abus/val/ABUS_XXX.npz    + .pkl  (10% of data)
+    ./data/abus/test/ABUS_XXX.npz   + .pkl  (10% of data)
 """
 
 import os
@@ -36,7 +42,7 @@ from batchgenerators.utilities.file_and_folder_operations import maybe_mkdir_p
 
 
 # ---------------------------------------------------------------------------
-# Helper functions (mirrored from DefaultPreprocessor to avoid modifying it)
+# Helper functions
 # ---------------------------------------------------------------------------
 
 def collect_foreground_intensities(segmentation, images, seed=1234,
@@ -132,6 +138,20 @@ def sample_foreground_locations(seg, classes_or_regions, seed=1234):
     return class_locs
 
 
+def check_mask_has_lesion(mask_path):
+    """Check if a mask file contains any lesion (non-zero voxels).
+
+    Returns
+    -------
+    has_lesion : bool
+    num_voxels : int
+    """
+    mask_itk = sitk.ReadImage(mask_path)
+    mask_arr = sitk.GetArrayFromImage(mask_itk)
+    num_voxels = int((mask_arr > 0).sum())
+    return num_voxels > 0, num_voxels
+
+
 # ---------------------------------------------------------------------------
 # Core preprocessing
 # ---------------------------------------------------------------------------
@@ -185,6 +205,7 @@ def preprocess_case(data_path, mask_path, case_name, output_dir,
 
     data_arr, seg_arr, bbox = crop_to_nonzero(data_arr, seg_arr)
     properties['bbox_used_for_cropping'] = bbox
+    properties['crop_bbox'] = bbox  # Also store as crop_bbox for compatibility
 
     shape_after_cropping = data_arr.shape[1:]
     properties['shape_after_cropping_before_resample'] = shape_after_cropping
@@ -215,85 +236,220 @@ def preprocess_case(data_path, mask_path, case_name, output_dir,
     with open(out_pkl, 'wb') as f:
         pickle.dump(properties, f)
 
-    print(f"  [{case_name}]  orig {shape_before_cropping} -> "
-          f"crop {shape_after_cropping}  spacing {spacing}")
+    return case_name, shape_before_cropping, shape_after_cropping, spacing
 
 
 # ---------------------------------------------------------------------------
-# Process an entire split
+# Collect all cases from all splits
 # ---------------------------------------------------------------------------
 
-def process_split(abus_root, split_name, output_dir, num_processes=4):
-    """Process all cases in one split (Train / Validation / Test)."""
-    split_dir = os.path.join(abus_root, "data", split_name)
-    data_dir = os.path.join(split_dir, "DATA")
-    mask_dir = os.path.join(split_dir, "MASK")
+def collect_all_cases(abus_root):
+    """Collect all valid cases from Train/Validation/Test folders.
 
-    maybe_mkdir_p(output_dir)
+    Returns list of (data_path, mask_path, case_id, original_split).
+    Only includes cases WITH lesions (non-empty masks).
+    """
+    splits = ["Train", "Validation", "Test"]
+    all_cases = []
+    skipped_no_lesion = []
+    skipped_no_mask = []
 
-    data_files = sorted(
-        [f for f in os.listdir(data_dir) if f.endswith('.nrrd')])
+    for split_name in splits:
+        split_dir = os.path.join(abus_root, "data", split_name)
+        data_dir = os.path.join(split_dir, "DATA")
+        mask_dir = os.path.join(split_dir, "MASK")
 
-    cases = []
-    for df in data_files:
-        case_id = df.replace("DATA_", "").replace(".nrrd", "")
-        mask_file = f"MASK_{case_id}.nrrd"
-        data_path = os.path.join(data_dir, df)
-        mask_path = os.path.join(mask_dir, mask_file)
-        case_name = f"ABUS_{case_id}"
-
-        if not os.path.exists(mask_path):
-            print(f"  Warning: mask not found for {df}, skipping")
+        if not os.path.exists(data_dir):
+            print(f"  Warning: {data_dir} not found, skipping")
             continue
 
-        cases.append((data_path, mask_path, case_name, output_dir))
+        data_files = sorted(
+            [f for f in os.listdir(data_dir) if f.endswith('.nrrd')])
+
+        for df in data_files:
+            case_id = df.replace("DATA_", "").replace(".nrrd", "")
+            mask_file = f"MASK_{case_id}.nrrd"
+            data_path = os.path.join(data_dir, df)
+            mask_path = os.path.join(mask_dir, mask_file)
+
+            if not os.path.exists(mask_path):
+                skipped_no_mask.append(case_id)
+                continue
+
+            # Check if mask has lesion
+            has_lesion, num_voxels = check_mask_has_lesion(mask_path)
+            if not has_lesion:
+                skipped_no_lesion.append(case_id)
+                continue
+
+            all_cases.append({
+                'data_path': data_path,
+                'mask_path': mask_path,
+                'case_id': case_id,
+                'original_split': split_name,
+                'lesion_voxels': num_voxels,
+            })
+
+    print(f"\n{'='*60}")
+    print(f"  Case Collection Summary")
+    print(f"{'='*60}")
+    print(f"  Valid cases (with lesion): {len(all_cases)}")
+    print(f"  Skipped (no mask file):    {len(skipped_no_mask)}")
+    print(f"  Skipped (no lesion):       {len(skipped_no_lesion)}")
+
+    if skipped_no_lesion:
+        print(f"  Cases without lesion: {skipped_no_lesion[:10]}{'...' if len(skipped_no_lesion) > 10 else ''}")
+
+    return all_cases
+
+
+def split_cases(all_cases, train_ratio=0.8, val_ratio=0.1, seed=42):
+    """Split cases into train/val/test with given ratios.
+
+    Parameters
+    ----------
+    all_cases : list of dict
+    train_ratio : float (default 0.8)
+    val_ratio : float (default 0.1)
+    seed : int (default 42)
+
+    Returns
+    -------
+    train_cases, val_cases, test_cases : lists
+    """
+    np.random.seed(seed)
+
+    n_total = len(all_cases)
+    n_train = int(n_total * train_ratio)
+    n_val = int(n_total * val_ratio)
+    n_test = n_total - n_train - n_val
+
+    # Shuffle
+    indices = np.random.permutation(n_total)
+
+    train_indices = indices[:n_train]
+    val_indices = indices[n_train:n_train + n_val]
+    test_indices = indices[n_train + n_val:]
+
+    train_cases = [all_cases[i] for i in train_indices]
+    val_cases = [all_cases[i] for i in val_indices]
+    test_cases = [all_cases[i] for i in test_indices]
+
+    print(f"\n  Split (seed={seed}):")
+    print(f"    Train:      {len(train_cases)} cases ({len(train_cases)/n_total*100:.1f}%)")
+    print(f"    Validation: {len(val_cases)} cases ({len(val_cases)/n_total*100:.1f}%)")
+    print(f"    Test:       {len(test_cases)} cases ({len(test_cases)/n_total*100:.1f}%)")
+
+    return train_cases, val_cases, test_cases
+
+
+# ---------------------------------------------------------------------------
+# Process cases
+# ---------------------------------------------------------------------------
+
+def process_cases(cases, output_dir, split_name, num_processes=4):
+    """Process a list of cases and save to output_dir."""
+    maybe_mkdir_p(output_dir)
+
+    if len(cases) == 0:
+        print(f"  No cases to process for {split_name}")
+        return
 
     print(f"\n{'='*60}")
     print(f"  Processing {split_name}: {len(cases)} cases")
     print(f"  Output -> {output_dir}")
     print(f"{'='*60}")
 
-    if len(cases) == 0:
-        return
+    # Prepare arguments
+    case_args = []
+    for case in cases:
+        case_name = f"ABUS_{case['case_id']}"
+        case_args.append((
+            case['data_path'],
+            case['mask_path'],
+            case_name,
+            output_dir
+        ))
 
-    # --- first case sequentially (sanity check) ---
-    preprocess_case(*cases[0])
+    # Process first case sequentially (sanity check)
+    result = preprocess_case(*case_args[0])
+    print(f"  [{result[0]}] orig {result[1]} -> crop {result[2]} spacing {result[3]}")
 
-    # --- remaining cases with multiprocessing ---
-    remaining_cases = cases[1:]
-    if len(remaining_cases) == 0:
+    # Process remaining cases
+    remaining_args = case_args[1:]
+    if len(remaining_args) == 0:
         return
 
     if num_processes > 1:
-        r = []
+        results = []
         with multiprocessing.get_context("spawn").Pool(num_processes) as p:
-            for case_args in remaining_cases:
-                r.append(p.apply_async(preprocess_case, case_args))
+            for args in remaining_args:
+                results.append(p.apply_async(preprocess_case, args))
 
             workers = [j for j in p._pool]
-            with tqdm(desc=split_name, total=len(remaining_cases)) as pbar:
-                remaining_idx = list(range(len(r)))
+            with tqdm(desc=split_name, total=len(remaining_args)) as pbar:
+                remaining_idx = list(range(len(results)))
                 while len(remaining_idx) > 0:
                     all_alive = all(j.is_alive() for j in workers)
                     if not all_alive:
                         raise RuntimeError(
                             "A background worker died. Possibly out of RAM. "
                             "Try reducing num_processes.")
-                    done = [i for i in remaining_idx if r[i].ready()]
-                    # Check for exceptions
+                    done = [i for i in remaining_idx if results[i].ready()]
                     for i in done:
-                        r[i].get()  # raises if the worker raised
+                        results[i].get()  # raises if worker raised
                     for _ in done:
                         pbar.update()
-                    remaining_idx = [
-                        i for i in remaining_idx if i not in done
-                    ]
+                    remaining_idx = [i for i in remaining_idx if i not in done]
                     sleep(0.1)
     else:
-        for case_args in tqdm(remaining_cases, desc=split_name):
-            preprocess_case(*case_args)
+        for args in tqdm(remaining_args, desc=split_name):
+            result = preprocess_case(*args)
 
     print(f"  Done: {split_name} ({len(cases)} cases)\n")
+
+
+def save_split_info(output_base, train_cases, val_cases, test_cases, seed):
+    """Save split information for reproducibility."""
+    split_info = {
+        'seed': seed,
+        'train_ratio': 0.8,
+        'val_ratio': 0.1,
+        'test_ratio': 0.1,
+        'train_cases': [c['case_id'] for c in train_cases],
+        'val_cases': [c['case_id'] for c in val_cases],
+        'test_cases': [c['case_id'] for c in test_cases],
+        'total_cases': len(train_cases) + len(val_cases) + len(test_cases),
+    }
+
+    info_path = os.path.join(output_base, 'split_info.pkl')
+    with open(info_path, 'wb') as f:
+        pickle.dump(split_info, f)
+
+    # Also save as readable text
+    txt_path = os.path.join(output_base, 'split_info.txt')
+    with open(txt_path, 'w') as f:
+        f.write(f"ABUS Dataset Split (seed={seed})\n")
+        f.write(f"{'='*50}\n\n")
+        f.write(f"Total cases (with lesion): {split_info['total_cases']}\n")
+        f.write(f"Train: {len(train_cases)} (80%)\n")
+        f.write(f"Val:   {len(val_cases)} (10%)\n")
+        f.write(f"Test:  {len(test_cases)} (10%)\n\n")
+
+        f.write(f"Train cases:\n")
+        for c in sorted(train_cases, key=lambda x: x['case_id']):
+            f.write(f"  {c['case_id']} (from {c['original_split']}, {c['lesion_voxels']} voxels)\n")
+
+        f.write(f"\nValidation cases:\n")
+        for c in sorted(val_cases, key=lambda x: x['case_id']):
+            f.write(f"  {c['case_id']} (from {c['original_split']}, {c['lesion_voxels']} voxels)\n")
+
+        f.write(f"\nTest cases:\n")
+        for c in sorted(test_cases, key=lambda x: x['case_id']):
+            f.write(f"  {c['case_id']} (from {c['original_split']}, {c['lesion_voxels']} voxels)\n")
+
+    print(f"  Saved split info to {info_path}")
+    print(f"  Saved readable split info to {txt_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +460,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="ABUS preprocessing: NRRD -> NPZ for SegMamba")
+        description="ABUS preprocessing: NRRD -> NPZ for SegMamba (80/10/10 split)")
     parser.add_argument("--abus_root", type=str,
                         default="/Volumes/Autzoko/ABUS",
                         help="Path to raw ABUS dataset root")
@@ -313,15 +469,60 @@ if __name__ == "__main__":
                         help="Output directory for preprocessed files")
     parser.add_argument("--num_processes", type=int, default=4,
                         help="Parallel workers (reduce if OOM)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for train/val/test split")
+    parser.add_argument("--train_ratio", type=float, default=0.8,
+                        help="Fraction of data for training (default 0.8)")
+    parser.add_argument("--val_ratio", type=float, default=0.1,
+                        help="Fraction of data for validation (default 0.1)")
     args = parser.parse_args()
 
-    process_split(args.abus_root, "Train",
-                  os.path.join(args.output_base, "train"), args.num_processes)
-    process_split(args.abus_root, "Validation",
-                  os.path.join(args.output_base, "val"), args.num_processes)
-    process_split(args.abus_root, "Test",
-                  os.path.join(args.output_base, "test"), args.num_processes)
-
     print("=" * 60)
-    print("  All preprocessing complete!")
+    print("  ABUS Preprocessing Pipeline")
+    print("  - Collects ALL cases from Train/Validation/Test folders")
+    print("  - Filters cases WITHOUT lesion (empty masks)")
+    print(f"  - Splits: {args.train_ratio*100:.0f}% train / {args.val_ratio*100:.0f}% val / {(1-args.train_ratio-args.val_ratio)*100:.0f}% test")
+    print(f"  - Random seed: {args.seed}")
+    print("=" * 60)
+
+    # Step 1: Collect all valid cases
+    print("\nStep 1: Collecting cases with lesions...")
+    all_cases = collect_all_cases(args.abus_root)
+
+    if len(all_cases) == 0:
+        print("ERROR: No valid cases found!")
+        sys.exit(1)
+
+    # Step 2: Split into train/val/test
+    print("\nStep 2: Splitting data...")
+    train_cases, val_cases, test_cases = split_cases(
+        all_cases,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        seed=args.seed
+    )
+
+    # Step 3: Create output directories
+    maybe_mkdir_p(args.output_base)
+    train_dir = os.path.join(args.output_base, "train")
+    val_dir = os.path.join(args.output_base, "val")
+    test_dir = os.path.join(args.output_base, "test")
+
+    # Step 4: Process each split
+    print("\nStep 3: Processing cases...")
+    process_cases(train_cases, train_dir, "Train", args.num_processes)
+    process_cases(val_cases, val_dir, "Validation", args.num_processes)
+    process_cases(test_cases, test_dir, "Test", args.num_processes)
+
+    # Step 5: Save split information
+    print("\nStep 4: Saving split information...")
+    save_split_info(args.output_base, train_cases, val_cases, test_cases, args.seed)
+
+    print("\n" + "=" * 60)
+    print("  Preprocessing Complete!")
+    print("=" * 60)
+    print(f"  Output directory: {args.output_base}")
+    print(f"  Train: {len(train_cases)} cases -> {train_dir}")
+    print(f"  Val:   {len(val_cases)} cases -> {val_dir}")
+    print(f"  Test:  {len(test_cases)} cases -> {test_dir}")
     print("=" * 60)

@@ -885,11 +885,16 @@ def validate_full_volume(
             seg_probs_full = seg_sum / weight_sum
             seg_pred = (seg_probs_full[1] > 0.5).astype(np.int64)
 
-            # Compute Dice
+            # Compute Dice (only for volumes with GT)
+            gt_sum = (mask == 1).sum()
+            pred_sum = (seg_pred == 1).sum()
             intersection = ((seg_pred == 1) & (mask == 1)).sum()
-            union = (seg_pred == 1).sum() + (mask == 1).sum()
-            dice = 2 * intersection / (union + 1e-6)
-            all_dices.append(dice)
+
+            if gt_sum > 0:
+                dice = 2 * intersection / (pred_sum + gt_sum + 1e-6)
+                all_dices.append(dice)
+            else:
+                dice = float('nan')  # No GT, skip for average
 
             # Debug first volume
             if idx == 0:
@@ -897,8 +902,8 @@ def validate_full_volume(
                 print(f"    Volume shape: {volume_shape}, Positions: {len(positions)}")
                 print(f"    seg_probs_full[0] range: [{seg_probs_full[0].min():.4f}, {seg_probs_full[0].max():.4f}]")
                 print(f"    seg_probs_full[1] range: [{seg_probs_full[1].min():.4f}, {seg_probs_full[1].max():.4f}]")
-                print(f"    Pred==1: {(seg_pred == 1).sum()}, GT==1: {(mask == 1).sum()}")
-                print(f"    Intersection: {intersection}, Dice: {dice:.4f}")
+                print(f"    Pred==1: {pred_sum}, GT==1: {gt_sum}")
+                print(f"    Intersection: {intersection}, Dice: {dice:.4f}" if gt_sum > 0 else f"    No GT tumor in this volume")
 
             # Finalize detection with NMS
             if len(all_boxes) > 0:
@@ -932,8 +937,10 @@ def validate_full_volume(
 
     # Compute final metrics
     mean_dice = np.mean(all_dices) if all_dices else 0.0
+    num_with_gt = len(all_dices)
+    num_total = len(val_dataset)
 
-    det_metrics = {}
+    det_metrics = {'num_with_gt': num_with_gt, 'num_total': num_total}
     for iou_thresh in [0.1, 0.25, 0.5]:
         recall = total_tp[iou_thresh] / max(total_gt, 1)
         precision = total_tp[iou_thresh] / max(total_tp[iou_thresh] + total_fp[iou_thresh], 1)
@@ -1141,7 +1148,11 @@ def main():
               f"reg={train_metrics['reg_loss']:.4f}, "
               f"dice={train_metrics['dice']:.4f}, "
               f"avg_pos={train_metrics['avg_pos']:.1f}")
-        print(f"  Val ({val_mode}): dice={val_metrics['dice']:.4f}")
+        if 'num_with_gt' in val_metrics:
+            print(f"  Val ({val_mode}): dice={val_metrics['dice']:.4f} "
+                  f"({val_metrics['num_with_gt']}/{val_metrics['num_total']} volumes with GT)")
+        else:
+            print(f"  Val ({val_mode}): dice={val_metrics['dice']:.4f}")
         print(f"  Det: recall@0.25={val_metrics['recall@0.25']:.4f}, "
               f"precision@0.25={val_metrics['precision@0.25']:.4f}")
         print(f"       recall@0.5={val_metrics['recall@0.5']:.4f}, "
