@@ -972,6 +972,10 @@ def main():
     parser.add_argument("--sampler_batch_size", type=int, default=256)
     parser.add_argument("--sampler_pos_fraction", type=float, default=0.25)
 
+    # Validation
+    parser.add_argument("--full_volume_val", action="store_true",
+                        help="Use full-volume sliding window validation (slower but accurate)")
+
     # Misc
     parser.add_argument("--save_dir", type=str, default="./logs/segmamba_abus_retina")
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -993,8 +997,6 @@ def main():
         args.data_dir_train,
         fg_ratio=args.fg_ratio,
     )
-    # Full-volume dataset for validation (sliding window inference)
-    val_dataset = ABUSFullVolumeDataset(args.data_dir_val)
 
     train_loader = DataLoader(
         train_dataset,
@@ -1004,7 +1006,22 @@ def main():
         pin_memory=True,
         drop_last=True,
     )
-    # Note: val_dataset is used directly, not through DataLoader
+
+    # Validation dataset: full-volume or patch-based
+    if args.full_volume_val:
+        val_dataset = ABUSFullVolumeDataset(args.data_dir_val)
+        val_loader = None  # Not used for full-volume
+        print("Using FULL-VOLUME validation (sliding window)")
+    else:
+        val_dataset = ABUSRetinaDataset(args.data_dir_val, fg_ratio=0.5)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        print("Using PATCH-BASED validation (faster, less accurate)")
 
     # Create model
     model = SegMambaWithRetina(
@@ -1067,11 +1084,19 @@ def main():
 
         scheduler.step()
 
-        # Full-volume validation with sliding window
-        val_metrics = validate_full_volume(
-            model, val_dataset, box_coder, device,
-            overlap=0.5, score_threshold=0.05, nms_threshold=0.5
-        )
+        # Validation: full-volume or patch-based
+        if args.full_volume_val:
+            val_metrics = validate_full_volume(
+                model, val_dataset, box_coder, device,
+                overlap=0.5, score_threshold=0.05, nms_threshold=0.5
+            )
+            val_mode = "full-vol"
+        else:
+            val_metrics = validate(
+                model, val_loader, dice_loss_fn, box_coder, device,
+                debug=(epoch == 1)
+            )
+            val_mode = "patch"
 
         print(f"\nEpoch {epoch}/{args.max_epoch}")
         print(f"  Train: loss={train_metrics['loss']:.4f}, "
@@ -1080,7 +1105,7 @@ def main():
               f"reg={train_metrics['reg_loss']:.4f}, "
               f"dice={train_metrics['dice']:.4f}, "
               f"avg_pos={train_metrics['avg_pos']:.1f}")
-        print(f"  Val: dice={val_metrics['dice']:.4f} (full-volume)")
+        print(f"  Val ({val_mode}): dice={val_metrics['dice']:.4f}")
         print(f"  Det: recall@0.25={val_metrics['recall@0.25']:.4f}, "
               f"precision@0.25={val_metrics['precision@0.25']:.4f}")
         print(f"       recall@0.5={val_metrics['recall@0.5']:.4f}, "
