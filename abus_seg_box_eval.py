@@ -296,12 +296,12 @@ def evaluate_detections(pred_dir, abus_root, split="Test", min_volume=100):
     pred_files = sorted([f for f in os.listdir(pred_dir) if f.endswith('.nii.gz')])
     if len(pred_files) == 0:
         print(f"No .nii.gz files found in {pred_dir}")
-        return None
+        return None, None
 
     gt_mask_dir = os.path.join(abus_root, "data", split, "MASK")
     if not os.path.exists(gt_mask_dir):
         print(f"GT mask directory not found: {gt_mask_dir}")
-        return None
+        return None, None
 
     print(f"Evaluating {len(pred_files)} predictions against GT masks...")
 
@@ -463,7 +463,8 @@ def main():
     results, detections = evaluate_detections(
         args.pred_dir, args.abus_root, args.split, args.min_volume)
 
-    if results is None:
+    if results is None or detections is None:
+        print("Evaluation failed. Check paths and try again.")
         return
 
     # Print summary
