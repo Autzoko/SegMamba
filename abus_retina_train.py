@@ -572,7 +572,7 @@ def validate(
     dice_loss_fn: nn.Module,
     box_coder: BoxCoder3D,
     device: torch.device,
-    score_threshold: float = 0.3,
+    score_threshold: float = 0.05,
     debug: bool = False,
 ):
     """Validate the model with both segmentation and detection metrics."""
