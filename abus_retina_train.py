@@ -891,6 +891,15 @@ def validate_full_volume(
             dice = 2 * intersection / (union + 1e-6)
             all_dices.append(dice)
 
+            # Debug first volume
+            if idx == 0:
+                print(f"\n  DEBUG Full-Vol Validation (first volume):")
+                print(f"    Volume shape: {volume_shape}, Positions: {len(positions)}")
+                print(f"    seg_probs_full[0] range: [{seg_probs_full[0].min():.4f}, {seg_probs_full[0].max():.4f}]")
+                print(f"    seg_probs_full[1] range: [{seg_probs_full[1].min():.4f}, {seg_probs_full[1].max():.4f}]")
+                print(f"    Pred==1: {(seg_pred == 1).sum()}, GT==1: {(mask == 1).sum()}")
+                print(f"    Intersection: {intersection}, Dice: {dice:.4f}")
+
             # Finalize detection with NMS
             if len(all_boxes) > 0:
                 all_boxes = torch.cat(all_boxes, dim=0)
