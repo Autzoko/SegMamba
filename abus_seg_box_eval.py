@@ -1,24 +1,17 @@
 """
-SegMamba Segmentation-to-Box Evaluation for ABUS.
+Segmentation-to-Box Detection Evaluation for ABUS (CPU only).
 
-Complete workflow for evaluating detection via segmentation:
-1. Run SegMamba segmentation inference (optional, skip if predictions exist)
-2. Extract bounding boxes from predicted masks via connected components
-3. Extract bounding boxes from GT masks
-4. Compute IoU and detection metrics
+Evaluates detection performance by extracting bounding boxes from
+segmentation predictions and comparing against GT boxes.
 
-This provides a baseline for detection performance using only segmentation,
-which can be compared against dedicated detection pipelines (FCOS, DETR, BoxHead).
+This script does NOT require GPU - run on CPU nodes after inference.
 
-Usage:
-    # Full pipeline (inference + evaluation)
-    python abus_seg_box_eval.py \
-        --model_path ./logs/segmamba_abus/model/best_model.pt \
-        --run_inference
+Workflow:
+1. Run inference on GPU node:
+   python abus_seg_inference.py --model_path ... --output_dir ./predictions
 
-    # Evaluation only (if predictions already exist)
-    python abus_seg_box_eval.py \
-        --pred_dir ./prediction_results/segmamba_abus
+2. Run evaluation on CPU node (this script):
+   python abus_seg_box_eval.py --pred_dir ./predictions
 
 Output:
     - detections.json: Predicted boxes in standard format
@@ -26,22 +19,12 @@ Output:
 """
 
 import os
-import glob
 import argparse
 import json
 import numpy as np
-import pickle
 import SimpleITK as sitk
 from scipy import ndimage
 from tqdm import tqdm
-
-# Optional: for inference
-try:
-    import torch
-    from torch.cuda.amp import autocast
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
 
 
 def extract_boxes_from_mask(mask):
@@ -132,147 +115,6 @@ def compute_iou_matrix(pred_boxes, gt_boxes):
     return iou_matrix
 
 
-def run_inference(model_path, data_dir, output_dir, device="cuda:0"):
-    """Run SegMamba segmentation inference."""
-    if not TORCH_AVAILABLE:
-        raise RuntimeError("PyTorch not available. Install torch to run inference.")
-
-    from model_segmamba.segmamba import SegMamba
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load model
-    model = SegMamba(
-        in_chans=1, out_chans=2,
-        depths=[2, 2, 2, 2],
-        feat_size=[48, 96, 192, 384],
-    ).to(device)
-
-    sd = torch.load(model_path, map_location='cpu')
-    if 'module' in sd:
-        sd = sd['module']
-    new_sd = {k[7:] if k.startswith('module.') else k: v for k, v in sd.items()}
-    model.load_state_dict(new_sd, strict=False)
-    model.eval()
-    print(f"Loaded model from {model_path}")
-
-    # Find test files
-    npz_files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
-    print(f"Processing {len(npz_files)} cases...")
-
-    PATCH_SIZE = (128, 128, 128)
-
-    for npz_path in tqdm(npz_files, desc="Inference"):
-        data = np.load(npz_path)
-        volume = data['data'].astype(np.float32)  # (1, D, H, W)
-
-        pkl_path = npz_path.replace('.npz', '.pkl')
-        with open(pkl_path, 'rb') as f:
-            props = pickle.load(f)
-
-        case_name = props.get('name', os.path.basename(npz_path).replace('.npz', ''))
-        volume_shape = volume.shape[1:]
-
-        # Sliding window inference with Gaussian weighting
-        positions = _sliding_window_positions(volume_shape, PATCH_SIZE, overlap=0.5)
-
-        # Create Gaussian weight
-        sigma = [s / 4 for s in PATCH_SIZE]
-        zz, yy, xx = np.mgrid[:PATCH_SIZE[0], :PATCH_SIZE[1], :PATCH_SIZE[2]]
-        center = [s / 2 for s in PATCH_SIZE]
-        gaussian = np.exp(-((zz - center[0])**2 / (2*sigma[0]**2) +
-                            (yy - center[1])**2 / (2*sigma[1]**2) +
-                            (xx - center[2])**2 / (2*sigma[2]**2)))
-
-        output = np.zeros((2, *volume_shape), dtype=np.float32)
-        weight_sum = np.zeros(volume_shape, dtype=np.float32)
-
-        with torch.no_grad():
-            for pos in positions:
-                z, y, x = pos
-                patch = volume[:, z:z+PATCH_SIZE[0], y:y+PATCH_SIZE[1], x:x+PATCH_SIZE[2]]
-
-                # Pad if necessary
-                if patch.shape[1:] != PATCH_SIZE:
-                    pad_d = PATCH_SIZE[0] - patch.shape[1]
-                    pad_h = PATCH_SIZE[1] - patch.shape[2]
-                    pad_w = PATCH_SIZE[2] - patch.shape[3]
-                    patch = np.pad(patch, ((0, 0), (0, pad_d), (0, pad_h), (0, pad_w)))
-
-                patch_t = torch.from_numpy(patch[np.newaxis]).to(device)
-
-                with autocast():
-                    logits = model(patch_t)
-
-                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-
-                # Crop to valid region
-                d_end = min(z + PATCH_SIZE[0], volume_shape[0]) - z
-                h_end = min(y + PATCH_SIZE[1], volume_shape[1]) - y
-                w_end = min(x + PATCH_SIZE[2], volume_shape[2]) - x
-
-                output[:, z:z+d_end, y:y+h_end, x:x+w_end] += (
-                    probs[:, :d_end, :h_end, :w_end] * gaussian[:d_end, :h_end, :w_end])
-                weight_sum[z:z+d_end, y:y+h_end, x:x+w_end] += gaussian[:d_end, :h_end, :w_end]
-
-        # Normalize
-        weight_sum = np.maximum(weight_sum, 1e-6)
-        output = output / weight_sum
-
-        # Get prediction
-        seg_pred = (output[1] > 0.5).astype(np.uint8)
-
-        # Restore to original shape if cropped
-        if 'shape_before_cropping' in props and 'crop_bbox' in props:
-            full_shape = props['shape_before_cropping']
-            crop_bbox = props['crop_bbox']
-            full_seg = np.zeros(full_shape, dtype=np.uint8)
-            full_seg[crop_bbox[0][0]:crop_bbox[0][1],
-                     crop_bbox[1][0]:crop_bbox[1][1],
-                     crop_bbox[2][0]:crop_bbox[2][1]] = seg_pred
-            seg_pred = full_seg
-
-        # Save as NIfTI
-        spacing = props.get('spacing', [1.0, 1.0, 1.0])
-        if isinstance(spacing[0], torch.Tensor):
-            spacing = [s.item() for s in spacing]
-
-        seg_itk = sitk.GetImageFromArray(seg_pred)
-        seg_itk.SetSpacing(list(spacing)[::-1])
-        sitk.WriteImage(seg_itk, os.path.join(output_dir, f"{case_name}.nii.gz"))
-
-    print(f"Saved predictions to {output_dir}")
-
-
-def _sliding_window_positions(volume_shape, patch_size, overlap=0.5):
-    """Generate sliding window positions."""
-    positions = []
-    stride = [int(p * (1 - overlap)) for p in patch_size]
-
-    for z in range(0, max(1, volume_shape[0] - patch_size[0] + 1), stride[0]):
-        for y in range(0, max(1, volume_shape[1] - patch_size[1] + 1), stride[1]):
-            for x in range(0, max(1, volume_shape[2] - patch_size[2] + 1), stride[2]):
-                positions.append((z, y, x))
-
-    if len(positions) == 0:
-        positions.append((0, 0, 0))
-
-    # Add corners
-    z_max = max(0, volume_shape[0] - patch_size[0])
-    y_max = max(0, volume_shape[1] - patch_size[1])
-    x_max = max(0, volume_shape[2] - patch_size[2])
-
-    corners = [
-        (0, 0, 0), (0, 0, x_max), (0, y_max, 0), (0, y_max, x_max),
-        (z_max, 0, 0), (z_max, 0, x_max), (z_max, y_max, 0), (z_max, y_max, x_max),
-    ]
-    for pos in corners:
-        if pos not in positions and all(p >= 0 for p in pos):
-            positions.append(pos)
-
-    return positions
-
-
 def build_gt_box_cache(abus_root, split="Test", cache_path=None):
     """Build or load cached GT boxes to avoid repeated NRRD reads.
 
@@ -348,37 +190,30 @@ def build_gt_box_cache(abus_root, split="Test", cache_path=None):
     return gt_boxes_cache
 
 
-def evaluate_detections(pred_dir, abus_root, split="Test", min_volume=100, gt_cache=None):
+def evaluate_detections(pred_dir, gt_cache, min_volume=100):
     """Evaluate detection metrics from segmentation predictions.
 
     Parameters
     ----------
     pred_dir : str
         Directory with segmentation predictions (.nii.gz)
-    abus_root : str
-        Root directory of ABUS dataset
-    split : str
-        Dataset split (Train, Validation, Test)
+    gt_cache : dict
+        Pre-loaded GT boxes cache from build_gt_box_cache()
     min_volume : int
         Minimum component volume to consider as detection
-    gt_cache : dict, optional
-        Pre-loaded GT boxes cache from build_gt_box_cache().
-        If None, will load from cache file or build from scratch.
 
     Returns
     -------
     results : dict
         Evaluation metrics and per-case results
+    all_detections : dict
+        Detections in standard format for saving
     """
     # Find prediction files
     pred_files = sorted([f for f in os.listdir(pred_dir) if f.endswith('.nii.gz')])
     if len(pred_files) == 0:
         print(f"No .nii.gz files found in {pred_dir}")
         return None, None
-
-    # Build or load GT box cache if not provided
-    if gt_cache is None:
-        gt_cache = build_gt_box_cache(abus_root, split)
 
     if len(gt_cache) == 0:
         print("No GT boxes available")
@@ -427,7 +262,6 @@ def evaluate_detections(pred_dir, abus_root, split="Test", min_volume=100, gt_ca
 
         gt_data = gt_cache[case_id]
         gt_boxes = gt_data['boxes']
-        gt_volumes = gt_data['volumes']
 
         # Compute IoU matrix
         iou_matrix = compute_iou_matrix(pred_boxes, gt_boxes)
@@ -511,33 +345,23 @@ def evaluate_detections(pred_dir, abus_root, split="Test", min_volume=100, gt_ca
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate detection via SegMamba segmentation")
-    parser.add_argument("--model_path", type=str, default="",
-                        help="Path to trained SegMamba checkpoint (for inference)")
-    parser.add_argument("--data_dir", type=str, default="./data/abus/test",
-                        help="Directory with preprocessed test data (for inference)")
-    parser.add_argument("--pred_dir", type=str,
-                        default="./prediction_results/segmamba_abus",
+        description="Evaluate segmentation-to-box detection (CPU only)")
+    parser.add_argument("--pred_dir", type=str, required=True,
                         help="Directory with segmentation predictions (.nii.gz)")
     parser.add_argument("--abus_root", type=str, default="/Volumes/Autzoko/ABUS",
-                        help="Root directory of ABUS dataset")
+                        help="Root directory of ABUS dataset (for GT masks)")
     parser.add_argument("--split", type=str, default="Test",
-                        choices=["Train", "Validation", "Test"])
-    parser.add_argument("--run_inference", action="store_true",
-                        help="Run segmentation inference first")
+                        choices=["Train", "Validation", "Test"],
+                        help="Dataset split for GT masks")
     parser.add_argument("--min_volume", type=int, default=100,
                         help="Minimum component volume to consider as detection")
     parser.add_argument("--rebuild_cache", action="store_true",
-                        help="Force rebuild GT box cache (slow, only needed once)")
-    parser.add_argument("--device", type=str, default="cuda:0")
+                        help="Force rebuild GT box cache")
     args = parser.parse_args()
 
-    # Run inference if requested
-    if args.run_inference:
-        if not args.model_path:
-            print("Error: --model_path required when using --run_inference")
-            return
-        run_inference(args.model_path, args.data_dir, args.pred_dir, args.device)
+    print("=" * 60)
+    print("  Segmentation-to-Box Evaluation (CPU only)")
+    print("=" * 60)
 
     # Build or load GT box cache
     cache_path = os.path.join(args.abus_root, f"gt_boxes_cache_{args.split.lower()}.json")
@@ -547,9 +371,13 @@ def main():
 
     gt_cache = build_gt_box_cache(args.abus_root, args.split, cache_path)
 
+    if len(gt_cache) == 0:
+        print("ERROR: No GT boxes available. Check --abus_root path.")
+        return
+
     # Evaluate
     results, detections = evaluate_detections(
-        args.pred_dir, args.abus_root, args.split, args.min_volume, gt_cache=gt_cache)
+        args.pred_dir, gt_cache, args.min_volume)
 
     if results is None or detections is None:
         print("Evaluation failed. Check paths and try again.")
@@ -559,7 +387,7 @@ def main():
     print(f"\n{'='*70}")
     print(f"  Segmentation-to-Box Detection Evaluation ({args.split} split)")
     print(f"{'='*70}")
-    print(f"  Cases:           {results['summary']['n_cases']}")
+    print(f"  Cases:            {results['summary']['n_cases']}")
     print(f"  Total Pred Boxes: {results['summary']['total_pred_boxes']}")
     print(f"  Total GT Boxes:   {results['summary']['total_gt_boxes']}")
     print(f"\n  Mean Best IoU:    {results['summary']['mean_best_iou']:.4f}")
