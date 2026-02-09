@@ -1,8 +1,8 @@
 """
 Segmentation-to-Box Detection Evaluation for ABUS (CPU only).
 
-Evaluates detection performance by extracting bounding boxes from
-segmentation predictions and comparing against GT boxes.
+Evaluates both segmentation quality (Dice, HD95) and detection performance
+by extracting bounding boxes from segmentation predictions.
 
 This script does NOT require GPU - run on CPU nodes after inference.
 
@@ -15,7 +15,7 @@ Workflow:
 
 Output:
     - detections.json: Predicted boxes in standard format
-    - seg_box_metrics.json: IoU metrics and per-case results
+    - seg_box_metrics.json: Segmentation and detection metrics
 """
 
 import os
@@ -26,6 +26,90 @@ import SimpleITK as sitk
 from scipy import ndimage
 from tqdm import tqdm
 
+try:
+    from medpy import metric as medpy_metric
+    HAS_MEDPY = True
+except ImportError:
+    HAS_MEDPY = False
+    print("Warning: medpy not installed. HD95 will not be computed.")
+    print("Install with: pip install medpy")
+
+
+# ---------------------------------------------------------------------------
+# Segmentation Metrics
+# ---------------------------------------------------------------------------
+
+def compute_segmentation_metrics(pred_mask, gt_mask, voxel_spacing=None):
+    """Compute segmentation metrics for a single case.
+
+    Parameters
+    ----------
+    pred_mask : np.ndarray
+        Binary prediction mask (D, H, W)
+    gt_mask : np.ndarray
+        Binary ground truth mask (D, H, W)
+    voxel_spacing : tuple, optional
+        Voxel spacing in (z, y, x) order for HD95 computation
+
+    Returns
+    -------
+    metrics : dict
+        Dictionary with Dice, precision, recall, HD95
+    """
+    pred_bin = pred_mask > 0
+    gt_bin = gt_mask > 0
+
+    pred_sum = pred_bin.sum()
+    gt_sum = gt_bin.sum()
+    intersection = (pred_bin & gt_bin).sum()
+
+    # Dice coefficient
+    if pred_sum + gt_sum == 0:
+        dice = 1.0  # Both empty
+    else:
+        dice = 2.0 * intersection / (pred_sum + gt_sum)
+
+    # Precision (positive predictive value)
+    if pred_sum == 0:
+        precision = 1.0 if gt_sum == 0 else 0.0
+    else:
+        precision = intersection / pred_sum
+
+    # Recall (sensitivity)
+    if gt_sum == 0:
+        recall = 1.0 if pred_sum == 0 else 0.0
+    else:
+        recall = intersection / gt_sum
+
+    # HD95 (Hausdorff Distance 95th percentile)
+    hd95 = np.nan
+    if HAS_MEDPY and pred_sum > 0 and gt_sum > 0:
+        try:
+            if voxel_spacing is not None:
+                hd95 = medpy_metric.binary.hd95(pred_bin, gt_bin, voxelspacing=voxel_spacing)
+            else:
+                hd95 = medpy_metric.binary.hd95(pred_bin, gt_bin)
+        except Exception:
+            hd95 = np.nan
+    elif pred_sum == 0 and gt_sum == 0:
+        hd95 = 0.0
+    elif pred_sum == 0 or gt_sum == 0:
+        hd95 = 50.0  # Large penalty for complete miss
+
+    return {
+        'dice': float(dice),
+        'precision': float(precision),
+        'recall': float(recall),
+        'hd95': float(hd95) if not np.isnan(hd95) else None,
+        'pred_voxels': int(pred_sum),
+        'gt_voxels': int(gt_sum),
+        'intersection': int(intersection),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Bounding Box Extraction
+# ---------------------------------------------------------------------------
 
 def extract_boxes_from_mask(mask):
     """Extract bounding boxes from a binary mask using connected components.
@@ -190,13 +274,17 @@ def build_gt_box_cache(abus_root, split="Test", cache_path=None):
     return gt_boxes_cache
 
 
-def evaluate_detections(pred_dir, gt_cache, min_volume=100):
-    """Evaluate detection metrics from segmentation predictions.
+def evaluate_all(pred_dir, abus_root, split, gt_cache, min_volume=100):
+    """Evaluate both segmentation and detection metrics.
 
     Parameters
     ----------
     pred_dir : str
         Directory with segmentation predictions (.nii.gz)
+    abus_root : str
+        Root directory of ABUS dataset (for loading GT masks)
+    split : str
+        Dataset split (Train, Validation, Test)
     gt_cache : dict
         Pre-loaded GT boxes cache from build_gt_box_cache()
     min_volume : int
@@ -205,7 +293,7 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
     Returns
     -------
     results : dict
-        Evaluation metrics and per-case results
+        Evaluation metrics (segmentation + detection) and per-case results
     all_detections : dict
         Detections in standard format for saving
     """
@@ -219,12 +307,18 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
         print("No GT boxes available")
         return None, None
 
-    print(f"Evaluating {len(pred_files)} predictions against {len(gt_cache)} cached GT boxes...")
+    gt_mask_dir = os.path.join(abus_root, "data", split, "MASK")
+    print(f"Evaluating {len(pred_files)} predictions...")
+    print(f"  GT boxes from cache: {len(gt_cache)} cases")
+    print(f"  GT masks from: {gt_mask_dir}")
 
     all_detections = {}
     case_results = []
 
-    # IoU thresholds for metrics
+    # Segmentation metrics storage
+    seg_metrics_list = []
+
+    # IoU thresholds for detection metrics
     iou_thresholds = [0.1, 0.25, 0.5, 0.75]
 
     for pf in tqdm(pred_files, desc="Evaluating"):
@@ -236,6 +330,48 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
         pred_itk = sitk.ReadImage(pred_path)
         pred_mask = sitk.GetArrayFromImage(pred_itk).astype(np.uint8)
 
+        # Get GT boxes from cache
+        if case_id not in gt_cache:
+            print(f"  Warning: GT not found in cache for {case_name}, skipping")
+            continue
+
+        gt_data = gt_cache[case_id]
+        gt_boxes = gt_data['boxes']
+
+        # ===== SEGMENTATION METRICS =====
+        # Load GT mask for segmentation evaluation
+        gt_mask_path = os.path.join(gt_mask_dir, f"MASK_{case_id}.nrrd")
+        seg_result = {
+            'case_id': case_id,
+            'case_name': case_name,
+            'dice': None,
+            'precision': None,
+            'recall': None,
+            'hd95': None,
+            'has_gt': len(gt_boxes) > 0,
+        }
+
+        if os.path.exists(gt_mask_path):
+            gt_itk = sitk.ReadImage(gt_mask_path)
+            gt_mask = sitk.GetArrayFromImage(gt_itk).astype(np.uint8)
+
+            # Check shape match
+            if pred_mask.shape == gt_mask.shape:
+                # Get voxel spacing (z, y, x order)
+                spacing_xyz = gt_itk.GetSpacing()
+                voxel_spacing = list(spacing_xyz)[::-1]
+
+                seg_m = compute_segmentation_metrics(pred_mask, gt_mask, voxel_spacing)
+                seg_result.update(seg_m)
+            else:
+                print(f"  Warning: shape mismatch for {case_name}: "
+                      f"pred {pred_mask.shape} vs gt {gt_mask.shape}")
+        else:
+            print(f"  Warning: GT mask not found: {gt_mask_path}")
+
+        seg_metrics_list.append(seg_result)
+
+        # ===== BOUNDING BOX DETECTION =====
         # Extract predicted boxes
         pred_boxes, pred_volumes = extract_boxes_from_mask(pred_mask)
 
@@ -254,14 +390,6 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
         for vol in pred_volumes:
             score = min(1.0, vol / 10000.0)
             pred_scores.append(float(max(score, 0.01)))
-
-        # Get GT boxes from cache
-        if case_id not in gt_cache:
-            print(f"  Warning: GT not found in cache for {case_name}, skipping")
-            continue
-
-        gt_data = gt_cache[case_id]
-        gt_boxes = gt_data['boxes']
 
         # Compute IoU matrix
         iou_matrix = compute_iou_matrix(pred_boxes, gt_boxes)
@@ -287,7 +415,7 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
             else:
                 detected_at[t] = 0
 
-        # Store results
+        # Store detection results
         case_results.append({
             'case_id': case_id,
             'case_name': case_name,
@@ -298,6 +426,9 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
             'detected_at': detected_at,
             'pred_boxes': pred_boxes.tolist(),
             'gt_boxes': gt_boxes.tolist(),
+            # Include segmentation metrics
+            'dice': seg_result.get('dice'),
+            'hd95': seg_result.get('hd95'),
         })
 
         # Store for JSON output
@@ -306,7 +437,36 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
             "scores": pred_scores,
         }
 
-    # Aggregate metrics
+    # ===== AGGREGATE SEGMENTATION METRICS =====
+    # Only compute mean over cases with GT (non-empty masks)
+    cases_with_gt = [s for s in seg_metrics_list if s['has_gt'] and s['dice'] is not None]
+
+    if len(cases_with_gt) > 0:
+        mean_dice = np.mean([s['dice'] for s in cases_with_gt])
+        std_dice = np.std([s['dice'] for s in cases_with_gt])
+        mean_precision = np.mean([s['precision'] for s in cases_with_gt])
+        mean_recall = np.mean([s['recall'] for s in cases_with_gt])
+
+        hd95_values = [s['hd95'] for s in cases_with_gt if s['hd95'] is not None]
+        mean_hd95 = np.mean(hd95_values) if hd95_values else None
+        std_hd95 = np.std(hd95_values) if hd95_values else None
+    else:
+        mean_dice = std_dice = 0.0
+        mean_precision = mean_recall = 0.0
+        mean_hd95 = std_hd95 = None
+
+    seg_summary = {
+        'n_cases_with_gt': len(cases_with_gt),
+        'n_cases_total': len(seg_metrics_list),
+        'mean_dice': float(mean_dice),
+        'std_dice': float(std_dice),
+        'mean_precision': float(mean_precision),
+        'mean_recall': float(mean_recall),
+        'mean_hd95': float(mean_hd95) if mean_hd95 is not None else None,
+        'std_hd95': float(std_hd95) if std_hd95 is not None else None,
+    }
+
+    # ===== AGGREGATE DETECTION METRICS =====
     total_gt = sum(r['n_gt'] for r in case_results)
     total_pred = sum(r['n_pred'] for r in case_results)
 
@@ -314,8 +474,8 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
     detection_rates = {}
     for t in iou_thresholds:
         detected_cases = sum(1 for r in case_results if r['detected_at'][t] > 0 and r['n_gt'] > 0)
-        cases_with_gt = sum(1 for r in case_results if r['n_gt'] > 0)
-        detection_rates[t] = detected_cases / max(cases_with_gt, 1)
+        cases_with_gt_count = sum(1 for r in case_results if r['n_gt'] > 0)
+        detection_rates[t] = detected_cases / max(cases_with_gt_count, 1)
 
     # Recall (fraction of GT boxes detected)
     recall_at = {}
@@ -327,17 +487,21 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
     mean_best_iou = np.mean([r['best_iou'] for r in case_results if r['n_gt'] > 0]) if case_results else 0.0
     mean_gt_iou_all = np.mean([r['mean_gt_iou'] for r in case_results if r['n_gt'] > 0]) if case_results else 0.0
 
+    det_summary = {
+        'n_cases': len(case_results),
+        'total_pred_boxes': total_pred,
+        'total_gt_boxes': total_gt,
+        'mean_best_iou': float(mean_best_iou),
+        'mean_gt_iou': float(mean_gt_iou_all),
+    }
+
     results = {
-        'summary': {
-            'n_cases': len(case_results),
-            'total_pred_boxes': total_pred,
-            'total_gt_boxes': total_gt,
-            'mean_best_iou': float(mean_best_iou),
-            'mean_gt_iou': float(mean_gt_iou_all),
-        },
+        'segmentation': seg_summary,
+        'detection': det_summary,
         'detection_rate': {str(t): detection_rates[t] for t in iou_thresholds},
         'recall': {str(t): recall_at[t] for t in iou_thresholds},
         'per_case': case_results,
+        'seg_per_case': seg_metrics_list,
     }
 
     return results, all_detections
@@ -345,7 +509,7 @@ def evaluate_detections(pred_dir, gt_cache, min_volume=100):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate segmentation-to-box detection (CPU only)")
+        description="Evaluate segmentation and box detection (CPU only)")
     parser.add_argument("--pred_dir", type=str, required=True,
                         help="Directory with segmentation predictions (.nii.gz)")
     parser.add_argument("--abus_root", type=str, default="/Volumes/Autzoko/ABUS",
@@ -359,9 +523,9 @@ def main():
                         help="Force rebuild GT box cache")
     args = parser.parse_args()
 
-    print("=" * 60)
-    print("  Segmentation-to-Box Evaluation (CPU only)")
-    print("=" * 60)
+    print("=" * 70)
+    print("  ABUS Segmentation & Detection Evaluation (CPU only)")
+    print("=" * 70)
 
     # Build or load GT box cache
     cache_path = os.path.join(args.abus_root, f"gt_boxes_cache_{args.split.lower()}.json")
@@ -375,23 +539,43 @@ def main():
         print("ERROR: No GT boxes available. Check --abus_root path.")
         return
 
-    # Evaluate
-    results, detections = evaluate_detections(
-        args.pred_dir, gt_cache, args.min_volume)
+    # Evaluate (segmentation + detection)
+    results, detections = evaluate_all(
+        args.pred_dir, args.abus_root, args.split, gt_cache, args.min_volume)
 
     if results is None or detections is None:
         print("Evaluation failed. Check paths and try again.")
         return
 
-    # Print summary
+    # ===== PRINT SEGMENTATION METRICS FIRST =====
+    seg = results['segmentation']
     print(f"\n{'='*70}")
-    print(f"  Segmentation-to-Box Detection Evaluation ({args.split} split)")
+    print(f"  SEGMENTATION METRICS ({args.split} split)")
     print(f"{'='*70}")
-    print(f"  Cases:            {results['summary']['n_cases']}")
-    print(f"  Total Pred Boxes: {results['summary']['total_pred_boxes']}")
-    print(f"  Total GT Boxes:   {results['summary']['total_gt_boxes']}")
-    print(f"\n  Mean Best IoU:    {results['summary']['mean_best_iou']:.4f}")
-    print(f"  Mean GT IoU:      {results['summary']['mean_gt_iou']:.4f}")
+    print(f"  Cases evaluated:  {seg['n_cases_with_gt']} / {seg['n_cases_total']} (with GT)")
+    print(f"\n  Dice Coefficient:")
+    print(f"    Mean:   {seg['mean_dice']:.4f}")
+    print(f"    Std:    {seg['std_dice']:.4f}")
+    print(f"\n  Precision (PPV):  {seg['mean_precision']:.4f}")
+    print(f"  Recall (Sens):    {seg['mean_recall']:.4f}")
+    if seg['mean_hd95'] is not None:
+        print(f"\n  Hausdorff Distance 95 (mm):")
+        print(f"    Mean:   {seg['mean_hd95']:.2f}")
+        print(f"    Std:    {seg['std_hd95']:.2f}")
+    else:
+        print(f"\n  HD95: Not computed (install medpy)")
+    print(f"{'='*70}")
+
+    # ===== PRINT DETECTION METRICS SECOND =====
+    det = results['detection']
+    print(f"\n{'='*70}")
+    print(f"  BOUNDING BOX DETECTION METRICS ({args.split} split)")
+    print(f"{'='*70}")
+    print(f"  Cases:            {det['n_cases']}")
+    print(f"  Total Pred Boxes: {det['total_pred_boxes']}")
+    print(f"  Total GT Boxes:   {det['total_gt_boxes']}")
+    print(f"\n  Mean Best IoU:    {det['mean_best_iou']:.4f}")
+    print(f"  Mean GT IoU:      {det['mean_gt_iou']:.4f}")
     print(f"\n  Detection Rate (case-level, at least one GT detected):")
     for t in ['0.1', '0.25', '0.5', '0.75']:
         print(f"    @IoU={t}:  {results['detection_rate'][t]:.4f}")
@@ -414,23 +598,34 @@ def main():
     with open(metrics_path, 'w') as f:
         # Remove per-case boxes to reduce file size
         results_clean = {
-            'summary': results['summary'],
+            'segmentation': results['segmentation'],
+            'detection': results['detection'],
             'detection_rate': results['detection_rate'],
             'recall': results['recall'],
             'per_case': [
                 {k: v for k, v in r.items() if k not in ['pred_boxes', 'gt_boxes']}
                 for r in results['per_case']
-            ]
+            ],
+            'seg_per_case': results['seg_per_case'],
         }
         json.dump(results_clean, f, indent=2)
     print(f"Saved metrics to: {metrics_path}")
 
-    # Print per-case details for cases with low IoU
-    print(f"\n  Per-case results (cases with best_IoU < 0.5):")
+    # Print per-case segmentation details (worst cases)
+    print(f"\n  Segmentation: Cases with lowest Dice (showing up to 10):")
+    cases_with_dice = [s for s in results['seg_per_case'] if s['dice'] is not None and s['has_gt']]
+    for s in sorted(cases_with_dice, key=lambda x: x['dice'])[:10]:
+        hd_str = f"HD95={s['hd95']:.1f}" if s['hd95'] is not None else "HD95=N/A"
+        print(f"    {s['case_name']}: Dice={s['dice']:.4f} Prec={s['precision']:.4f} "
+              f"Rec={s['recall']:.4f} {hd_str}")
+
+    # Print per-case detection details (low IoU cases)
+    print(f"\n  Detection: Cases with best_IoU < 0.5 (showing up to 10):")
     low_iou_cases = [r for r in results['per_case'] if r['best_iou'] < 0.5 and r['n_gt'] > 0]
     for r in sorted(low_iou_cases, key=lambda x: x['best_iou'])[:10]:
+        dice_str = f"Dice={r['dice']:.4f}" if r['dice'] is not None else "Dice=N/A"
         print(f"    {r['case_name']}: pred={r['n_pred']} gt={r['n_gt']} "
-              f"best_IoU={r['best_iou']:.4f}")
+              f"best_IoU={r['best_iou']:.4f} {dice_str}")
 
 
 if __name__ == "__main__":
