@@ -37,41 +37,19 @@ import numpy as np
 import cv2
 import torch
 import SimpleITK as sitk
-from torch.cuda.amp import autocast
 from tqdm import tqdm
 from pycocotools import mask as maskUtils
+from monai.inferers import SlidingWindowInferer
+
+try:
+    from medpy import metric as medpy_metric
+    HAS_MEDPY = True
+except ImportError:
+    HAS_MEDPY = False
+    print("Warning: medpy not installed. Using manual Dice computation.")
 
 
 PATCH_SIZE = (128, 128, 128)
-
-
-def sliding_window_positions(volume_shape, patch_size, overlap=0.5):
-    """Generate sliding window positions with given overlap."""
-    positions = []
-    stride = [int(p * (1 - overlap)) for p in patch_size]
-
-    for z in range(0, max(1, volume_shape[0] - patch_size[0] + 1), stride[0]):
-        for y in range(0, max(1, volume_shape[1] - patch_size[1] + 1), stride[1]):
-            for x in range(0, max(1, volume_shape[2] - patch_size[2] + 1), stride[2]):
-                positions.append((z, y, x))
-
-    if len(positions) == 0:
-        positions.append((0, 0, 0))
-
-    # Add corner positions
-    z_max = max(0, volume_shape[0] - patch_size[0])
-    y_max = max(0, volume_shape[1] - patch_size[1])
-    x_max = max(0, volume_shape[2] - patch_size[2])
-
-    corners = [
-        (0, 0, 0), (0, 0, x_max), (0, y_max, 0), (0, y_max, x_max),
-        (z_max, 0, 0), (z_max, 0, x_max), (z_max, y_max, 0), (z_max, y_max, x_max),
-    ]
-    for pos in corners:
-        if pos not in positions and all(p >= 0 for p in pos):
-            positions.append(pos)
-
-    return positions
 
 
 def compute_bbox_from_mask(mask_2d):
@@ -99,8 +77,12 @@ def encode_mask_rle(mask_2d):
     return rle
 
 
-def run_inference_3d(model, volume, device, patch_size, overlap=0.5):
-    """Run sliding window inference on a 3D volume.
+def run_inference_3d(model, volume, device, patch_size, overlap=0.5, use_tta=True):
+    """Run sliding window inference on a 3D volume using MONAI's SlidingWindowInferer.
+
+    This matches the original 4_predict.py implementation:
+    - Uses MONAI SlidingWindowInferer with mode="gaussian"
+    - Supports Test-Time Augmentation (TTA) with mirroring
 
     Parameters
     ----------
@@ -114,62 +96,83 @@ def run_inference_3d(model, volume, device, patch_size, overlap=0.5):
         Patch size (D, H, W)
     overlap : float
         Overlap between patches
+    use_tta : bool
+        Whether to use test-time augmentation with mirroring
 
     Returns
     -------
     seg_pred : np.ndarray
         Binary segmentation prediction of shape (D, H, W)
     """
-    volume_shape = volume.shape[1:]
+    # Create MONAI SlidingWindowInferer (same as original 4_predict.py)
+    window_infer = SlidingWindowInferer(
+        roi_size=list(patch_size),
+        sw_batch_size=2,
+        overlap=overlap,
+        progress=False,
+        mode="gaussian"
+    )
 
-    # Pre-compute Gaussian weight
-    sigma = [s / 4 for s in patch_size]
-    zz, yy, xx = np.mgrid[:patch_size[0], :patch_size[1], :patch_size[2]]
-    center = [s / 2 for s in patch_size]
-    gaussian = np.exp(-((zz - center[0])**2 / (2*sigma[0]**2) +
-                        (yy - center[1])**2 / (2*sigma[1]**2) +
-                        (xx - center[2])**2 / (2*sigma[2]**2))).astype(np.float32)
-
-    # Sliding window inference
-    positions = sliding_window_positions(volume_shape, patch_size, overlap)
-
-    output = np.zeros((2, *volume_shape), dtype=np.float32)
-    weight_sum = np.zeros(volume_shape, dtype=np.float32)
+    # Convert to tensor
+    volume_t = torch.from_numpy(volume[np.newaxis]).float().to(device)  # (1, 1, D, H, W)
 
     with torch.no_grad():
-        for pos in positions:
-            z, y, x = pos
-            patch = volume[:, z:z+patch_size[0], y:y+patch_size[1], x:x+patch_size[2]]
+        if use_tta:
+            # Test-Time Augmentation with mirroring (same as original)
+            # Mirror axes: 0=D, 1=H, 2=W (after batch and channel dims)
+            outputs = []
 
-            # Pad if necessary
-            if patch.shape[1:] != tuple(patch_size):
-                pad_d = patch_size[0] - patch.shape[1]
-                pad_h = patch_size[1] - patch.shape[2]
-                pad_w = patch_size[2] - patch.shape[3]
-                patch = np.pad(patch, ((0, 0), (0, pad_d), (0, pad_h), (0, pad_w)))
+            # Original
+            out = window_infer(volume_t, model)
+            outputs.append(torch.softmax(out, dim=1))
 
-            patch_t = torch.from_numpy(patch[np.newaxis]).to(device)
+            # Mirror along each axis and combinations
+            for axes in [[2], [3], [4], [2, 3], [2, 4], [3, 4], [2, 3, 4]]:
+                flipped = torch.flip(volume_t, dims=axes)
+                out = window_infer(flipped, model)
+                out = torch.softmax(out, dim=1)
+                # Flip back
+                out = torch.flip(out, dims=axes)
+                outputs.append(out)
 
-            with autocast():
-                logits = model(patch_t)
+            # Average all TTA outputs
+            output = torch.stack(outputs, dim=0).mean(dim=0)
+        else:
+            # No TTA
+            output = window_infer(volume_t, model)
+            output = torch.softmax(output, dim=1)
 
-            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-
-            # Crop to valid region
-            d_end = min(z + patch_size[0], volume_shape[0]) - z
-            h_end = min(y + patch_size[1], volume_shape[1]) - y
-            w_end = min(x + patch_size[2], volume_shape[2]) - x
-
-            output[:, z:z+d_end, y:y+h_end, x:x+w_end] += (
-                probs[:, :d_end, :h_end, :w_end] * gaussian[:d_end, :h_end, :w_end])
-            weight_sum[z:z+d_end, y:y+h_end, x:x+w_end] += gaussian[:d_end, :h_end, :w_end]
-
-    # Normalize and threshold
-    weight_sum = np.maximum(weight_sum, 1e-6)
-    output = output / weight_sum
-    seg_pred = (output[1] > 0.5).astype(np.uint8)
+    # Get prediction (argmax or threshold)
+    probs = output[0].cpu().numpy()  # (C, D, H, W)
+    seg_pred = (probs[1] > 0.5).astype(np.uint8)  # Foreground class
 
     return seg_pred
+
+
+def compute_dice_medpy(pred, gt):
+    """Compute Dice using medpy (same as 5_compute_metrics.py).
+
+    Edge case handling matches original:
+    - If both pred and gt have voxels: compute Dice
+    - Otherwise: return 0.0
+    """
+    if HAS_MEDPY:
+        if pred.sum() > 0 and gt.sum() > 0:
+            return medpy_metric.binary.dc(pred, gt)
+        else:
+            return 0.0
+    else:
+        # Fallback to manual computation
+        pred_bin = pred > 0
+        gt_bin = gt > 0
+        intersection = (pred_bin & gt_bin).sum()
+        pred_sum = pred_bin.sum()
+        gt_sum = gt_bin.sum()
+
+        if pred_sum > 0 and gt_sum > 0:
+            return 2.0 * intersection / (pred_sum + gt_sum)
+        else:
+            return 0.0
 
 
 def find_original_nrrd(case_id, abus_root):
@@ -189,7 +192,7 @@ def find_original_nrrd(case_id, abus_root):
 
 def process_volume(
     model, npz_path, pkl_path, abus_root, output_dir, split_name,
-    device, patch_size, overlap, slice_axis=2
+    device, patch_size, overlap, slice_axis=2, use_tta=True
 ):
     """Process a single volume: inference + 2D slice extraction.
 
@@ -215,6 +218,8 @@ def process_volume(
         Overlap for sliding window
     slice_axis : int
         Axis along which to extract 2D slices (default: 2 = elevation)
+    use_tta : bool
+        Whether to use test-time augmentation with mirroring
 
     Returns
     -------
@@ -245,8 +250,8 @@ def process_volume(
     mask_itk = sitk.ReadImage(mask_nrrd_path)
     original_gt_mask = sitk.GetArrayFromImage(mask_itk)
 
-    # Run 3D inference
-    seg_pred_cropped = run_inference_3d(model, volume, device, patch_size, overlap)
+    # Run 3D inference (using MONAI SlidingWindowInferer, same as 4_predict.py)
+    seg_pred_cropped = run_inference_3d(model, volume, device, patch_size, overlap, use_tta)
 
     # Restore to original shape if cropped during preprocessing
     if 'shape_before_cropping' in props and 'crop_bbox' in props:
@@ -328,17 +333,8 @@ def process_volume(
         })
         slices_with_pred += 1
 
-    # Compute 3D Dice score for the volume
-    pred_bin = seg_pred > 0
-    gt_bin = original_gt_mask > 0
-    intersection = (pred_bin & gt_bin).sum()
-    pred_sum = pred_bin.sum()
-    gt_sum = gt_bin.sum()
-
-    if pred_sum + gt_sum == 0:
-        dice_3d = 1.0
-    else:
-        dice_3d = 2.0 * intersection / (pred_sum + gt_sum)
+    # Compute 3D Dice score for the volume (same as 5_compute_metrics.py)
+    dice_3d = compute_dice_medpy(seg_pred > 0, original_gt_mask > 0)
 
     return slices_info, case_name, float(dice_3d), int(slices_with_pred)
 
@@ -442,8 +438,17 @@ def main():
                         help="Sliding window overlap (0.0-0.9)")
     parser.add_argument("--slice_axis", type=int, default=2,
                         help="Axis for 2D slicing (0=axial, 1=coronal, 2=elevation)")
+    parser.add_argument("--use_tta", action="store_true",
+                        help="Use test-time augmentation with mirroring (same as 4_predict.py)")
+    parser.add_argument("--no_tta", action="store_true",
+                        help="Disable test-time augmentation for faster inference")
 
     args = parser.parse_args()
+
+    # Handle TTA flag (default: use TTA to match original)
+    use_tta = not args.no_tta
+    if args.use_tta:
+        use_tta = True
 
     print("=" * 70)
     print("  SegMamba -> UltraSAM Box Prompt Generation")
@@ -454,6 +459,7 @@ def main():
     print(f"  Output:     {args.output_dir}")
     print(f"  Split:      {args.split}")
     print(f"  Slice axis: {args.slice_axis}")
+    print(f"  TTA:        {use_tta} (test-time augmentation with mirroring)")
     print("=" * 70)
 
     # Load model
@@ -497,7 +503,8 @@ def main():
 
         result = process_volume(
             model, npz_path, pkl_path, args.abus_root, args.output_dir,
-            args.split, args.device, PATCH_SIZE, args.overlap, args.slice_axis
+            args.split, args.device, PATCH_SIZE, args.overlap, args.slice_axis,
+            use_tta=use_tta
         )
 
         if result is None or len(result) != 4:
