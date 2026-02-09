@@ -235,7 +235,7 @@ def process_volume(
     data_nrrd_path, mask_nrrd_path = find_original_nrrd(case_id, abus_root)
     if data_nrrd_path is None:
         print(f"  Warning: Original NRRD not found for {case_name}, skipping")
-        return []
+        return None
 
     # Load original image (for PNG export)
     data_itk = sitk.ReadImage(data_nrrd_path)
@@ -324,11 +324,23 @@ def process_volume(
             'pred_segmentation': pred_rle,
             'gt_area': float(gt_slice.sum()),
             'gt_segmentation': gt_rle,
-            'has_gt': gt_slice.any(),
+            'has_gt': bool(gt_slice.any()),  # Convert numpy bool to Python bool
         })
         slices_with_pred += 1
 
-    return slices_info
+    # Compute 3D Dice score for the volume
+    pred_bin = seg_pred > 0
+    gt_bin = original_gt_mask > 0
+    intersection = (pred_bin & gt_bin).sum()
+    pred_sum = pred_bin.sum()
+    gt_sum = gt_bin.sum()
+
+    if pred_sum + gt_sum == 0:
+        dice_3d = 1.0
+    else:
+        dice_3d = 2.0 * intersection / (pred_sum + gt_sum)
+
+    return slices_info, case_name, float(dice_3d), int(slices_with_pred)
 
 
 def build_coco_annotations(all_slices_info, output_dir, split_name):
@@ -469,29 +481,49 @@ def main():
         return
 
     print(f"\nProcessing {len(npz_files)} volumes...")
+    print(f"\n{'Case':<15} {'Dice':>8} {'Slices':>8}")
+    print("-" * 35)
 
     # Process each volume
     all_slices_info = []
+    all_dice_scores = []
 
-    for npz_path in tqdm(npz_files, desc="Volumes"):
+    for npz_path in npz_files:
         pkl_path = npz_path.replace('.npz', '.pkl')
 
         if not os.path.exists(pkl_path):
             print(f"  Warning: PKL not found for {npz_path}, skipping")
             continue
 
-        slices_info = process_volume(
+        result = process_volume(
             model, npz_path, pkl_path, args.abus_root, args.output_dir,
             args.split, args.device, PATCH_SIZE, args.overlap, args.slice_axis
         )
+
+        if result is None or len(result) != 4:
+            continue
+
+        slices_info, case_name, dice_3d, n_slices_case = result
         all_slices_info.extend(slices_info)
+        all_dice_scores.append(dice_3d)
+
+        # Display per-case Dice score
+        print(f"{case_name:<15} {dice_3d:>8.4f} {n_slices_case:>8}")
+
+    # Show summary of Dice scores
+    if all_dice_scores:
+        mean_dice = np.mean(all_dice_scores)
+        std_dice = np.std(all_dice_scores)
+        print("-" * 35)
+        print(f"{'Mean':<15} {mean_dice:>8.4f}")
+        print(f"{'Std':<15} {std_dice:>8.4f}")
 
     # Build COCO annotations
     print(f"\nBuilding COCO annotations...")
     n_slices = build_coco_annotations(all_slices_info, args.output_dir, args.split)
 
     # Summary
-    n_volumes = len(npz_files)
+    n_volumes = len(all_dice_scores)
     n_with_gt = sum(1 for s in all_slices_info if s['has_gt'])
 
     print(f"\n{'='*70}")
@@ -500,6 +532,11 @@ def main():
     print(f"  Volumes processed:   {n_volumes}")
     print(f"  Slices with pred:    {n_slices}")
     print(f"  Slices with GT:      {n_with_gt}")
+    if all_dice_scores:
+        print(f"\n  SegMamba 3D Segmentation Performance:")
+        print(f"    Mean Dice:  {np.mean(all_dice_scores):.4f} +/- {np.std(all_dice_scores):.4f}")
+        print(f"    Min Dice:   {np.min(all_dice_scores):.4f}")
+        print(f"    Max Dice:   {np.max(all_dice_scores):.4f}")
     print(f"\n  Output directory:    {args.output_dir}")
     print(f"  Images:              {args.output_dir}/images/{args.split}/")
     print(f"  Annotations:         {args.output_dir}/annotations/{args.split}.coco.json")
